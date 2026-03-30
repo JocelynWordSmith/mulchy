@@ -25,15 +25,14 @@ def _get_sos(hz: float, order: int = 2) -> np.ndarray:
 
 def _get_adsr(n: int) -> np.ndarray:
     if n not in _adsr_cache:
-        _adsr_cache[n] = _adsr(n, attack=0.20, decay=0.05, sustain=0.85, release=0.0)
+        _adsr_cache[n] = _adsr(n, attack=0.20, decay=0.05, sustain=0.85, release=0.10)
     return _adsr_cache[n]
 
 
-def synthesize(features: ImageFeatures, prev_buffer: np.ndarray = None) -> np.ndarray:
+def synthesize(features: ImageFeatures) -> np.ndarray:
     """
     Render one audio chunk from image features.
-    Returns float32 numpy array, shape (N,), values roughly -1..1
-    prev_buffer: previous chunk for crossfade (optional)
+    Returns float32 numpy array, shape (N,), values roughly -1..1.
     """
     n_samples = int(cfg.SAMPLE_RATE * cfg.AUDIO_SECONDS)
 
@@ -60,15 +59,13 @@ def synthesize(features: ImageFeatures, prev_buffer: np.ndarray = None) -> np.nd
         mixed = mixed / peak * 0.85
     mixed *= cfg.MASTER_VOLUME
 
-    # Crossfade with previous buffer (use half the chunk so transitions are very smooth)
-    if prev_buffer is not None and len(prev_buffer) == n_samples:
-        fade_len = min(int(cfg.SAMPLE_RATE * 0.5), n_samples // 2)
-        fade_out = np.linspace(1.0, 0.0, fade_len)
-        fade_in  = np.linspace(0.0, 1.0, fade_len)
-        mixed[:fade_len] = (
-            mixed[:fade_len] * fade_in +
-            prev_buffer[-fade_len:] * fade_out
-        )
+    # Cosine taper at both ends — prevents clicks from phase discontinuities between buffers.
+    # CROSSFADE_SMOOTHNESS=0 → 40ms taper (audible ~80ms dip); =1 → 2ms (perceptually seamless).
+    taper_ms = max(2.0, 40.0 * (1.0 - cfg.CROSSFADE_SMOOTHNESS))
+    taper_n = min(int(cfg.SAMPLE_RATE * taper_ms / 1000.0), n_samples // 8)
+    taper   = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, taper_n)))
+    mixed[:taper_n]  *= taper         # fade in
+    mixed[-taper_n:] *= taper[::-1]   # fade out
 
     return mixed.astype(np.float32)
 

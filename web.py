@@ -55,7 +55,7 @@ def update(raw_frame, blended_frame, features, audio_chunk=None):
     fj = _encode_jpeg(blended_frame) if _client_count > 0 else None
 
     ab = None
-    if audio_chunk is not None and _client_count > 0 and (_seq - _audio_seq) >= 3:
+    if audio_chunk is not None and _client_count > 0 and (_seq - _audio_seq) >= 2:
         ds  = audio_chunk[::2]         # 44100 → 22050 Hz
         raw = (np.clip(ds, -1, 1) * 32767).astype(np.int16).tobytes()
         ab  = base64.b64encode(raw).decode()
@@ -166,6 +166,34 @@ def preset_get():
     })
 
 
+@app.route("/api/preset/delete", methods=["POST"])
+def preset_delete():
+    """Delete a custom preset and switch back to 'ambient'."""
+    global _active_preset, _custom_presets
+    name = _active_preset
+    if name not in _custom_presets:
+        return jsonify({"error": "only custom presets can be deleted"}), 400
+    _custom_presets.pop(name)
+    cfg.PRESETS.pop(name)
+    _preset_settings.pop(name, None)
+    _active_preset = "ambient"
+    cfg.load_preset(_active_preset)
+    for k, v in _preset_settings.get(_active_preset, {}).items():
+        if hasattr(cfg, k):
+            try:
+                setattr(cfg, k, type(getattr(cfg, k))(v))
+            except Exception:
+                pass
+    _save_state()
+    return jsonify({
+        "ok": True,
+        "preset": _active_preset,
+        "presets": list(cfg.PRESETS.keys()),
+        "custom": list(_custom_presets.keys()),
+        "settings": {k: getattr(cfg, k) for k, *_ in _SETTINGS_META},
+    })
+
+
 @app.route("/api/preset/clone", methods=["POST"])
 def preset_clone():
     global _active_preset, _custom_presets
@@ -271,6 +299,7 @@ _SETTINGS_META = [
     ("MOTION_PITCH_SEMITONES", int,   0,    24),
     ("MOTION_SENSITIVITY",     float, 0.5,  5.0),
     ("TONAL_WAVEFORM",         str,   None, None),
+    ("CROSSFADE_SMOOTHNESS",   float, 0.0,  1.0),
 ]
 
 
@@ -1104,7 +1133,7 @@ function toggleAudio(){
     analyser.fftSize=2048; analyser.smoothingTimeConstant=0.8;
     analyser.connect(audioCtx.destination);
     audioEnabled=true;
-    nextPlayTime=audioCtx.currentTime+0.4;
+    nextPlayTime=audioCtx.currentTime+1.0;
     btn.textContent='■ Browser Audio'; btn.classList.add('on');
     requestAnimationFrame(drawAnalyser);
   } else {
@@ -1169,6 +1198,7 @@ const SMETA=[
   {k:'MOTION_PITCH_SEMITONES',l:'Pitch Bend',  t:'r',min:0,  max:24,   s:1  },
   {k:'MOTION_SENSITIVITY',    l:'Motion Sens', t:'r',min:.5, max:5,    s:.1 },
   {k:'TONAL_WAVEFORM',        l:'Waveform',    t:'s',opts:['sine','triangle','sawtooth','square']},
+  {k:'CROSSFADE_SMOOTHNESS',  l:'Smoothness',  t:'r',min:0,  max:1,    s:.01},
 ];
 
 // sliderMap: key → {inp, sp} for updating on preset switch
@@ -1194,6 +1224,14 @@ function buildSettings(vals){
   rbtn.textContent='↺ Reset to factory defaults'; rbtn.onclick=()=>resetPreset();
   rrow.appendChild(rbtn);
   panel.appendChild(rrow);
+  // Delete row — visible only for custom presets
+  const drow=document.createElement('div'); drow.id='delete-row';
+  drow.style.cssText='display:none;padding:2px 0 4px 88px';
+  const dbtn=document.createElement('button'); dbtn.className='pbtn';
+  dbtn.style.cssText='font-size:.6rem;opacity:.5;color:#e05c5c;border-color:#e05c5c40';
+  dbtn.textContent='✕ Delete preset'; dbtn.onclick=()=>deletePreset();
+  drow.appendChild(dbtn);
+  panel.appendChild(drow);
   // Divider
   const div=document.createElement('div'); div.style.cssText='border-top:1px solid #1e1e2e;margin:4px 0';
   panel.appendChild(div);
@@ -1236,9 +1274,24 @@ function buildPresetButtons(container,presets,active){
 
 function highlightPreset(name){
   document.querySelectorAll('.pbtn[id^="pbtn-"]').forEach(b=>b.classList.toggle('on',b.id==='pbtn-'+name));
-  // Show reset button only for built-in (non-custom) presets
   const rrow=document.getElementById('reset-row');
-  if(rrow) rrow.style.display=customPresets.includes(name)?'none':'flex';
+  const drow=document.getElementById('delete-row');
+  const isCustom=customPresets.includes(name);
+  if(rrow) rrow.style.display=isCustom?'none':'flex';
+  if(drow) drow.style.display=isCustom?'flex':'none';
+}
+
+function deletePreset(){
+  if(!confirm('Delete "'+currentPreset+'"? This cannot be undone.')) return;
+  fetch('/api/preset/delete',{method:'POST'})
+    .then(r=>r.json()).then(d=>{
+      if(!d.ok){alert('Delete failed');return;}
+      currentPreset=d.preset;
+      customPresets=d.custom||[];
+      const pbg=document.getElementById('preset-buttons');
+      if(pbg) buildPresetButtons(pbg,d.presets,d.preset);
+      if(d.settings) syncSliders(d.settings);
+    });
 }
 
 function switchPreset(name){

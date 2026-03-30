@@ -84,21 +84,19 @@ class AudioPlayer:
 
     def _callback(self, outdata, frames, time_info, status):
         with self._lock:
-            if self._current is None or self._pos >= len(self._current):
-                # Load next buffer from queue
-                if self._queue:
-                    self._current = self._queue.pop(0)
-                    self._pos = 0
-                else:
-                    outdata[:] = 0
-                    return
-
-            remaining = len(self._current) - self._pos
-            chunk = min(frames, remaining)
-            outdata[:chunk, 0] = self._current[self._pos:self._pos + chunk]
-            if chunk < frames:
-                outdata[chunk:] = 0
-            self._pos += chunk
+            filled = 0
+            while filled < frames:
+                if self._current is None or self._pos >= len(self._current):
+                    if self._queue:
+                        self._current = self._queue.pop(0)
+                        self._pos = 0
+                    else:
+                        outdata[filled:, 0] = 0   # silence only if queue is empty
+                        return
+                chunk = min(frames - filled, len(self._current) - self._pos)
+                outdata[filled:filled + chunk, 0] = self._current[self._pos:self._pos + chunk]
+                filled += chunk
+                self._pos += chunk
 
     def queue(self, buffer: np.ndarray):
         with self._lock:
@@ -122,7 +120,6 @@ class Mulchy:
         self._running = False
         self._cam = Camera()
         self._player = AudioPlayer()
-        self._prev_buffer = None
         self._prev_frame = None
         web.run(preset=preset)
 
@@ -158,10 +155,9 @@ class Mulchy:
 
             # ── Synthesise ────────────────────────────────────────────────
             t2 = time.monotonic()
-            audio = synthesize(features, prev_buffer=self._prev_buffer)
+            audio = synthesize(features)
             synth_ms = (time.monotonic() - t2) * 1000
 
-            self._prev_buffer = audio
             self._player.queue(audio)
             web.update(raw_frame, frame, features, audio)
 

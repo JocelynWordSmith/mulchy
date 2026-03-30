@@ -17,6 +17,7 @@ SAMPLE_RATE   = 44100
 AUDIO_SECONDS = 2.0        # duration of each generated audio chunk
 AUDIO_CHANNELS = 1         # mono for now; set to 2 for stereo later
 MASTER_VOLUME = 0.7        # 0.0–1.0
+CROSSFADE_SMOOTHNESS = 0.0 # 0.0 = 40ms taper dip at boundaries; 1.0 = ~2ms (seamless)
 MIX_LOWPASS_HZ = 8000      # final low-pass on the whole mix (lower = warmer)
 
 # Per-layer mix levels (0.0–1.0)
@@ -92,6 +93,7 @@ PRESETS = {
         "MOTION_SENSITIVITY": 1.5,
         "MOTION_PITCH_SEMITONES": 7,
         "MOTION_TEMPO_SCALE": 0.5,
+        "CROSSFADE_SMOOTHNESS": 0.0,
     },
     # Slow, warm drone. Good for calm scenes or background listening.
     # Glitch off, tonal dominant, soft rhythm, warm low-pass, wide pitch range.
@@ -114,6 +116,7 @@ PRESETS = {
         "MOTION_SENSITIVITY": 2.0,
         "MOTION_PITCH_SEMITONES": 12,
         "MOTION_TEMPO_SCALE": 0.3,
+        "CROSSFADE_SMOOTHNESS": 0.7,
     },
     # Harsh, reactive, noisy. Glitch layer dominant, fast frames, bright mix.
     # Moving camera causes radical pitch and tempo shifts.
@@ -136,6 +139,7 @@ PRESETS = {
         "MOTION_SENSITIVITY": 3.0,
         "MOTION_PITCH_SEMITONES": 14,
         "MOTION_TEMPO_SCALE": 0.8,
+        "CROSSFADE_SMOOTHNESS": 0.0,
     },
     # Tight, punchy drums driven by image texture. Minimal glitch, narrow tonal range.
     # Works best with high-contrast scenes with repeated patterns.
@@ -158,6 +162,7 @@ PRESETS = {
         "MOTION_SENSITIVITY": 2.0,
         "MOTION_PITCH_SEMITONES": 5,
         "MOTION_TEMPO_SCALE": 0.7,
+        "CROSSFADE_SMOOTHNESS": 0.0,
     },
 }
 
