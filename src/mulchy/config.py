@@ -166,6 +166,7 @@ PRESETS = {
     },
 }
 
+
 def load_preset(name: str) -> None:
     """Apply a named preset by overwriting module-level vars. Call from main."""
     import sys

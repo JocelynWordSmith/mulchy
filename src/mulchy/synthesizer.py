@@ -6,8 +6,9 @@ Three layers: glitch (raw scanline), tonal (hue→pitch), rhythm (texture→drum
 
 import numpy as np
 from scipy.signal import butter, sosfilt
-from analyzer import ImageFeatures
-import config as cfg
+
+from mulchy import config as cfg
+from mulchy.analyzer import ImageFeatures
 
 # ── Filter / envelope caches ──────────────────────────────────────────────────
 # Butterworth design is expensive; cache by (rounded) cutoff frequency.
@@ -128,7 +129,6 @@ def _layer_tonal(features: ImageFeatures, n_samples: int) -> np.ndarray:
     # Motion: horizontal pan bends pitch like a theremin; vertical shifts octave
     motion = features.get("motion_amount", 0.0)
     motion_cx = features.get("motion_cx", 0.0)
-    motion_cy = features.get("motion_cy", 0.0)
     pitch_bend_semitones = motion_cx * cfg.MOTION_PITCH_SEMITONES * motion
     pitch_bend_ratio = _semitones_to_ratio(pitch_bend_semitones)
 
@@ -227,7 +227,6 @@ def _layer_rhythm(features: ImageFeatures, n_samples: int) -> np.ndarray:
 
     for step in range(n_steps):
         t_start = step * step_samples
-        beat_pos = step % (cfg.RHYTHM_SUBDIVISIONS)
         quarter   = step % 4 == 0
         backbeat  = step % 4 == 2
         eighth    = step % 2 == 0

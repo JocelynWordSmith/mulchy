@@ -57,7 +57,7 @@ Once mulchy is running, open a browser on any device on the same network and go 
 http://mulchy.local:5000
 ```
 
-If mDNS isn't available on your device, use the Pi's IP address directly (e.g. `http://192.168.0.142:5000`).
+If mDNS isn't available on your device, use the Pi's IP address directly (e.g. `http://192.168.1.x:5000`).
 
 The dashboard has three main areas:
 

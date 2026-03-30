@@ -3,22 +3,26 @@ Mulchy - Main
 Runs on boot. Captures frames, analyzes them, synthesizes audio, plays it.
 
 Boot setup (run once on Pi):
-    sudo pip install picamera2 sounddevice scipy numpy
-    # Add to /etc/rc.local or create a systemd service (see install.sh)
+    bash scripts/install.sh
+
+Dev machine (no camera, no audio):
+    uv run mulchy --source test --no-audio
 """
 
-import time
 import logging
 import signal
 import sys
-import threading
+import time
+
 import numpy as np
 
-import config as cfg
-from camera import Camera
-from analyzer import analyze
-from synthesizer import synthesize
-import web
+from mulchy import config as cfg
+from mulchy import web
+from mulchy.analyzer import analyze
+from mulchy.camera import Camera
+from mulchy.player import AudioPlayer, NullPlayer, SoundDevicePlayer
+from mulchy.sources import VideoSource, make_source
+from mulchy.synthesizer import synthesize
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -32,98 +36,23 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
-# ── Optional: future GPIO hook ────────────────────────────────────────────────
-# Uncomment and flesh out when buttons are wired up.
-#
-# def _setup_gpio():
-#     import RPi.GPIO as GPIO
-#     GPIO.setmode(GPIO.BCM)
-#     GPIO.setup(cfg.GPIO_BTN_FREEZE, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-#     GPIO.setup(cfg.GPIO_BTN_MODE,   GPIO.IN, pull_up_down=GPIO.PUD_UP)
-#     GPIO.setup(cfg.GPIO_LED_ACTIVE, GPIO.OUT)
-#     return GPIO
-#
-# def _is_frozen(GPIO) -> bool:
-#     return GPIO.input(cfg.GPIO_BTN_FREEZE) == GPIO.LOW
-
-
-# ── Optional: future display hook ─────────────────────────────────────────────
-# def _update_display(display, features):
-#     display.clear()
-#     display.text(f"B:{features['brightness']:.2f} S:{features['saturation']:.2f}", 0, 0)
-#     display.show()
-
-
-# ── Audio playback ────────────────────────────────────────────────────────────
-class AudioPlayer:
-    """
-    Wraps sounddevice for non-blocking streaming playback.
-    Queues the next buffer while the current one plays.
-    """
-    def __init__(self):
-        import sounddevice as sd
-        self._sd = sd
-        self._stream = None
-        self._lock = threading.Lock()
-        self._queue = []
-        self._pos = 0
-        self._current = None
-        self._start_stream()
-
-    def _start_stream(self):
-        self._stream = self._sd.OutputStream(
-            samplerate=cfg.SAMPLE_RATE,
-            channels=cfg.AUDIO_CHANNELS,
-            dtype="float32",
-            blocksize=2048,
-            callback=self._callback,
-        )
-        self._stream.start()
-        log.info("Audio stream started: %dHz, %dch",
-                 cfg.SAMPLE_RATE, cfg.AUDIO_CHANNELS)
-
-    def _callback(self, outdata, frames, time_info, status):
-        with self._lock:
-            filled = 0
-            while filled < frames:
-                if self._current is None or self._pos >= len(self._current):
-                    if self._queue:
-                        self._current = self._queue.pop(0)
-                        self._pos = 0
-                    else:
-                        outdata[filled:, 0] = 0   # silence only if queue is empty
-                        return
-                chunk = min(frames - filled, len(self._current) - self._pos)
-                outdata[filled:filled + chunk, 0] = self._current[self._pos:self._pos + chunk]
-                filled += chunk
-                self._pos += chunk
-
-    def queue(self, buffer: np.ndarray):
-        with self._lock:
-            # Keep queue shallow (max 2 buffers) to stay responsive
-            if len(self._queue) < 2:
-                self._queue.append(buffer)
-
-    def close(self):
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-
-
 # ── Main loop ─────────────────────────────────────────────────────────────────
 class Mulchy:
-    def __init__(self, preset: str = "ambient"):
+    def __init__(
+        self,
+        preset: str = "ambient",
+        source: VideoSource | None = None,
+        player: AudioPlayer | None = None,
+    ):
         if preset:
             cfg.load_preset(preset)
             log.info("Loaded preset: %s", preset)
 
         self._running = False
-        self._cam = Camera()
-        self._player = AudioPlayer()
-        self._prev_frame = None
+        self._cam = Camera(source if source is not None else make_source(None))
+        self._player = player if player is not None else SoundDevicePlayer()
+        self._prev_frame: np.ndarray | None = None
         web.run(preset=preset)
-
-        # Future: GPIO, display init goes here
 
         signal.signal(signal.SIGINT,  self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -144,8 +73,6 @@ class Mulchy:
 
             # ── Capture ───────────────────────────────────────────────────
             raw_frame, frame = self._cam.capture_blended()
-
-            # Future: if GPIO freeze button held, skip capture and reuse frame
 
             # ── Analyse ───────────────────────────────────────────────────
             t1 = time.monotonic()
@@ -180,9 +107,6 @@ class Mulchy:
                     features["motion_cx"],
                 )
 
-            # Future: update display here
-            # Future: check GPIO mode-cycle button here
-
             # ── Pace loop ─────────────────────────────────────────────────
             elapsed = time.monotonic() - t0
             sleep_for = frame_interval - elapsed
@@ -199,15 +123,33 @@ class Mulchy:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main():
     import argparse
     parser = argparse.ArgumentParser(description="Mulchy - image to audio")
     parser.add_argument(
         "--preset", default="ambient",
         choices=list(cfg.PRESETS.keys()),
-        help="Load a named preset (ambient | glitchy | percussive)",
+        help="Load a named preset (ambient | glitchy | percussive | default)",
+    )
+    parser.add_argument(
+        "--source", default=None,
+        help=(
+            "Video source: pi | webcam | test | "
+            "<path/to/video.mp4> | <path/to/image.jpg> | <path/to/dir/>"
+        ),
+    )
+    parser.add_argument(
+        "--no-audio", action="store_true",
+        help="Disable audio output (useful on machines without a sound device)",
     )
     args = parser.parse_args()
 
-    app = Mulchy(preset=args.preset)
+    source = make_source(args.source)
+    player: AudioPlayer = NullPlayer() if args.no_audio else SoundDevicePlayer()
+
+    app = Mulchy(preset=args.preset, source=source, player=player)
     app.run()
+
+
+if __name__ == "__main__":
+    main()

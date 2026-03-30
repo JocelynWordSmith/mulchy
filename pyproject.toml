@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mulchy"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "flask>=3.0",
+    "pillow>=10.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# picamera2 and sounddevice are installed manually on the Pi (see scripts/install.sh)
+# They are not listed here because picamera2 requires system apt packages (libcap-dev)
+# and sounddevice requires libportaudio2 — neither resolves cleanly in a standard venv.
+audio  = ["sounddevice"]
+webcam = ["opencv-python-headless"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "ruff>=0.4",
+    "playwright",
+    "pytest-playwright",
+]
+
+[project.scripts]
+mulchy = "mulchy.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mulchy"]
+
+[tool.ruff]
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # line too long — web.py has embedded HTML/JS strings
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = [
+    "--tb=short",
+    # Suppress ROS/ament pytest plugins that are registered system-wide but
+    # are incompatible with the Python 3.11 venv used here.
+    "-p", "no:launch_testing",
+    "-p", "no:launch_ros",
+    "-p", "no:ament_flake8",
+    "-p", "no:ament_pep257",
+    "-p", "no:ament_copyright",
+    "-p", "no:ament_xmllint",
+    "-p", "no:ament_lint",
+    "-p", "no:colcon_core_warnings_stderr",
+]
+
+[tool.coverage.run]
+source = ["src/mulchy"]
+omit   = ["*/tests/*"]

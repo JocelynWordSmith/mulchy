@@ -4,14 +4,15 @@ Lightweight Flask server for monitoring and control.
 Access at http://<pi-ip>:5000
 """
 
+import base64
 import hashlib
 import io
 import json
+import logging
 import os
 import subprocess
-import base64
 import threading
-import logging
+
 import numpy as np
 from flask import Flask, Response, jsonify, redirect, request, session
 
@@ -21,7 +22,9 @@ try:
 except ImportError:
     pass  # python-dotenv not installed; fall back to environment variables only
 
-import config as cfg
+import pathlib
+
+from mulchy import config as cfg
 
 log = logging.getLogger(__name__)
 app = Flask(__name__)
@@ -35,6 +38,21 @@ except Exception:
 
 # ── Shared state ───────────────────────────────────────────────────────────────
 
+def _default_state_file() -> pathlib.Path:
+    """
+    Resolve where state.json lives.
+    Respects existing Pi installations (~/mulchy/state.json) and XDG on other systems.
+    """
+    legacy = pathlib.Path.home() / "mulchy" / "state.json"
+    if legacy.exists():
+        return legacy
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = pathlib.Path(xdg) if xdg else pathlib.Path.home() / ".local" / "share"
+    p = base / "mulchy"
+    p.mkdir(parents=True, exist_ok=True)
+    return p / "state.json"
+
+
 _cond           = threading.Condition(threading.Lock())
 _frame_jpeg     = None   # clean blended frame, no overlays
 _features       = {}
@@ -45,7 +63,7 @@ _client_count   = 0      # active SSE clients; audio only encoded when > 0
 _active_preset  = "ambient"  # tracks which preset is loaded
 _custom_presets  = {}   # user-cloned presets; persisted to state.json
 _preset_settings = {}   # per-preset slider overrides; keyed by preset name
-_STATE_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+_STATE_FILE      = _default_state_file()
 
 
 def update(raw_frame, blended_frame, features, audio_chunk=None):
@@ -506,7 +524,7 @@ def wifi_status():
         return jsonify({"error": "unauthorized"}), 401
     con    = _active_client_con()
     ap_out, _, _ = _nmcli("-t", "-f", "NAME,STATE", "con", "show", "--active")
-    ap_up  = any(f"{_AP_CON}:activated" in l for l in ap_out.splitlines())
+    ap_up  = any(f"{_AP_CON}:activated" in line for line in ap_out.splitlines())
     return jsonify({
         "connected":  con,
         "ap":         ap_up,

@@ -4,10 +4,12 @@ Converts a numpy image array into a feature dict that the synthesizer understand
 No audio here — pure image analysis.
 """
 
+from typing import TypedDict
+
 import numpy as np
 from scipy import ndimage
-from typing import TypedDict
-import config as cfg
+
+from mulchy import config as cfg
 
 
 class ImageFeatures(TypedDict):

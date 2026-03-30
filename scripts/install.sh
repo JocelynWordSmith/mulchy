@@ -1,0 +1,83 @@
+#!/bin/bash
+# Mulchy installer for Raspberry Pi 3B
+# Run once as pi user: bash scripts/install.sh
+
+set -e
+INSTALL_DIR="$HOME/mulchy"
+
+echo "=== Mulchy Setup ==="
+
+# ── uv ────────────────────────────────────────────────────────────────────────
+if ! command -v uv &> /dev/null; then
+    echo "Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
+# ── Pi-specific system packages ───────────────────────────────────────────────
+# picamera2 and sounddevice require system libraries that cannot be cleanly
+# resolved via pip, so we use apt for picamera2 and install sounddevice after.
+echo "Installing Pi system packages..."
+sudo apt-get update -qq
+sudo apt-get install -y python3-picamera2 libportaudio2 portaudio19-dev
+
+# sounddevice needs libportaudio2 (installed above) before pip can use it
+pip install --break-system-packages sounddevice
+
+# ── Python dependencies (via uv) ──────────────────────────────────────────────
+echo "Installing Python dependencies via uv..."
+cd "$INSTALL_DIR"
+uv sync
+
+# ── Audio output configuration ────────────────────────────────────────────────
+echo "Configuring audio output to 3.5mm jack..."
+sudo amixer cset numid=3 1   # 0=auto, 1=headphones, 2=hdmi
+if ! grep -q "dtparam=audio=on" /boot/config.txt 2>/dev/null; then
+    echo "dtparam=audio=on" | sudo tee -a /boot/config.txt
+fi
+
+# ── Env file ──────────────────────────────────────────────────────────────────
+if [ ! -f "$INSTALL_DIR/.env" ]; then
+    echo "Creating .env from .env.example — set your WIFI_PASSWORD inside"
+    cp "$INSTALL_DIR/.env.example" "$INSTALL_DIR/.env"
+fi
+
+# ── Systemd service ───────────────────────────────────────────────────────────
+SERVICE_FILE="/etc/systemd/system/mulchy.service"
+echo "Creating systemd service at $SERVICE_FILE..."
+UV_BIN="$HOME/.local/bin/uv"
+
+sudo tee "$SERVICE_FILE" > /dev/null <<EOF
+[Unit]
+Description=Mulchy - camera to soundscape
+After=sound.target NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=$INSTALL_DIR
+ExecStartPre=/bin/sleep 3
+ExecStartPre=/usr/bin/amixer -c 1 sset PCM 100%
+ExecStart=$UV_BIN run --directory $INSTALL_DIR mulchy --preset ambient
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable mulchy.service
+
+echo ""
+echo "=== Done ==="
+echo "Edit $INSTALL_DIR/.env to set your WIFI_PASSWORD"
+echo ""
+echo "Start now:    sudo systemctl start mulchy"
+echo "Stop:         sudo systemctl stop mulchy"
+echo "Logs:         journalctl -u mulchy -f"
+echo "Run manually: uv run mulchy --preset ambient"
+echo "Test pattern: uv run mulchy --source test --no-audio"
