@@ -31,5 +31,5 @@ Thumbs.db
 # Runtime state (persisted settings, custom presets)
 state.json
 
-# exclude roadmap for now until its fleshed out
-ROADMAP.md
+# local only reference documents
+reference/

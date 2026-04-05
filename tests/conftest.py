@@ -31,6 +31,16 @@ def clear_analyzer_caches():
     import mulchy.analyzer as a
     a._row_idx_cache.clear()
     a._coord_cache.clear()
+    a._prev_gray = None
+    a._prev_features = None
+    yield
+
+
+@pytest.fixture(autouse=True)
+def clear_synth_state():
+    """Clear synthesizer stateful data before each test."""
+    from mulchy.synthesizer import reset_synth_state
+    reset_synth_state()
     yield
 
 

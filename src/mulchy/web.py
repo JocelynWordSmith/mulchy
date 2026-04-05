@@ -318,6 +318,18 @@ _SETTINGS_META = [
     ("MOTION_SENSITIVITY",     float, 0.5,  5.0),
     ("TONAL_WAVEFORM",         str,   None, None),
     ("CROSSFADE_SMOOTHNESS",   float, 0.0,  1.0),
+    ("FEATURE_SMOOTHING",      float, 0.0,  1.0),
+    ("COLOR_CLUSTER_SAMPLES",  int,   100,  5000),
+    ("FX_REVERB_ENABLED",      bool,  None, None),
+    ("FX_REVERB_ROOM_SIZE",    float, 0.0,  1.0),
+    ("FX_REVERB_WET",          float, 0.0,  1.0),
+    ("FX_CHORUS_ENABLED",      bool,  None, None),
+    ("FX_CHORUS_RATE",         float, 0.1,  10.0),
+    ("FX_CHORUS_DEPTH",        float, 0.0,  1.0),
+    ("FX_CHORUS_MIX",          float, 0.0,  1.0),
+    ("FX_COMPRESSOR_ENABLED",  bool,  None, None),
+    ("FX_COMPRESSOR_THRESHOLD", float, -60.0, 0.0),
+    ("FX_COMPRESSOR_RATIO",    float, 1.0,  20.0),
 ]
 
 
@@ -356,8 +368,10 @@ def _save_state():
         "preset_settings": _preset_settings,
     }
     try:
-        with open(_STATE_FILE, "w") as f:
+        tmp = _STATE_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
+        tmp.rename(_STATE_FILE)
     except Exception as e:
         log.error("Failed to save state: %s", e)
 

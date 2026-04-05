@@ -17,35 +17,107 @@ Inspired by the Wii RAM audio glitch — where raw memory data played back as au
 
 ```
 mulchy/
-├── config.py          ← all tunables live here, touch nothing else to tweak
-├── analyzer.py        ← image → feature dict (no audio code)
-├── synthesizer.py     ← feature dict → audio buffer (no image code)
-├── camera.py          ← picamera2 wrapper with frame blending + test pattern
-├── main.py            ← boot loop, orchestration, future hook points
-├── web.py             ← Flask web dashboard and WiFi management UI
-├── wifi_monitor.sh    ← watchdog script: activates AP when no client is connected
-└── install.sh         ← dependency install + systemd service setup
+├── src/mulchy/
+│   ├── config.py        ← all tunables live here; touch nothing else to tweak
+│   ├── analyzer.py      ← image → feature dict (no audio code)
+│   ├── synthesizer.py   ← feature dict → audio buffer (no image code)
+│   ├── sources.py       ← VideoSource implementations (Pi camera, webcam, test pattern, …)
+│   ├── camera.py        ← frame blending wrapper around a VideoSource
+│   ├── player.py        ← AudioPlayer implementations (sounddevice, null)
+│   ├── main.py          ← boot loop, orchestration, CLI entry point
+│   └── web.py           ← Flask web dashboard and WiFi management UI
+├── scripts/
+│   ├── install.sh       ← dependency install + systemd service setup (run once on Pi)
+│   └── wifi_monitor.sh  ← watchdog: activates AP when no client is connected
+├── tests/               ← unit, integration, and browser tests (dev only; not needed on Pi)
+├── pyproject.toml       ← package definition and dependencies
+└── .env.example         ← copy to .env and set WIFI_PASSWORD
 ```
 
-## Quick Start
+## Deploying to the Pi
+
+### First-time setup
 
 ```bash
-# Copy files to Pi
-scp -r mulchy/ pi@mulchy.local:~/
+# Push the project to the Pi (excludes dev-only dirs and the venv)
+rsync -av \
+  --exclude='.git' \
+  --exclude='.venv' \
+  --exclude='tests' \
+  --exclude='.github' \
+  --exclude='__pycache__' \
+  --exclude='*.pyc' \
+  --exclude='.pytest_cache' \
+  . pi@mulchy.local:~/mulchy/
 
-# SSH in and install
+# SSH in and run the installer once
 ssh pi@mulchy.local
-cd ~/mulchy
-bash install.sh
-
-# Run immediately (web dashboard starts automatically)
-python3 main.py
-
-# Or try a preset
-python3 main.py --preset ambient
-python3 main.py --preset glitchy
-python3 main.py --preset percussive
+bash ~/mulchy/scripts/install.sh
 ```
+
+`install.sh` installs uv, installs system packages (`python3-picamera2`, `libportaudio2`), installs Python dependencies, configures audio output, creates `.env` from `.env.example`, registers and enables the systemd service.
+
+After install, edit `~/mulchy/.env` on the Pi and set `WIFI_PASSWORD` to a password of your choice.
+
+### Pushing updates
+
+After changing code locally, push and restart:
+
+```bash
+rsync -av \
+  --exclude='.git' \
+  --exclude='.venv' \
+  --exclude='tests' \
+  --exclude='.github' \
+  --exclude='__pycache__' \
+  --exclude='*.pyc' \
+  --exclude='.pytest_cache' \
+  . pi@mulchy.local:~/mulchy/
+
+ssh pi@mulchy.local sudo systemctl restart mulchy
+```
+
+### Managing the service
+
+```bash
+sudo systemctl start mulchy     # start now
+sudo systemctl stop mulchy      # stop
+sudo systemctl status mulchy    # check status
+journalctl -u mulchy -f         # live logs
+```
+
+---
+
+## Local Development
+
+No Pi or camera required. Uses a test pattern (animated color gradient) and skips audio output:
+
+```bash
+# Install dev dependencies
+uv sync --extra dev
+
+# Run with test pattern, no audio
+uv run mulchy --source test --no-audio
+
+# Run with a webcam
+uv sync --extra webcam
+uv run mulchy --source webcam
+
+# Run with a video file or still image
+uv run mulchy --source path/to/video.mp4 --no-audio
+uv run mulchy --source path/to/photo.jpg --no-audio
+
+# Try different presets
+uv run mulchy --source test --no-audio --preset glitchy
+
+# Run tests
+uv run pytest tests/unit tests/integration -v
+
+# Lint
+uv run ruff check src/ tests/
+```
+
+The web dashboard is available at `http://localhost:5000` while the process is running.
 
 ---
 
@@ -94,6 +166,8 @@ Presets are full sound profiles. Switch between them in the Settings tab or at s
 
 Switching presets resets all sliders to the preset's values. You can then tweak individual sliders from that starting point.
 
+You can save a modified preset using the **Clone** button in the Settings tab, and delete custom presets with the **Delete** button that replaces it.
+
 ---
 
 ## Settings
@@ -105,6 +179,7 @@ Switching presets resets all sliders to the preset's values. You can then tweak 
 | **Volume** | Master output level (0–1). If audio is clipping or too quiet, adjust here first. |
 | **Blend Speed** | How quickly the camera reacts to changes. Low = slow dreamy drift. High = snappy and reactive. |
 | **Warmth** | Low-pass filter cutoff (300–15000 Hz). Lower = warmer, bassier sound. Higher = brighter, harsher. Scenes with sharp edges automatically push this up regardless of setting. |
+| **Smoothness** | How long the crossfade taper is at each buffer boundary (0–1). Low = longer fade (less clicking, more dip). High = very short taper (seamless, slightly more chance of click). |
 
 ### Layer Mix
 
@@ -417,14 +492,7 @@ Two separate smoothing mechanisms prevent jarring audio transitions as the scene
 
 This is the same exponential moving average used in financial charts and sensor smoothing everywhere.
 
-**Audio crossfading** (in `synthesizer.py`) handles the join between consecutive audio chunks. The first 0.5 seconds of each new chunk fades in as the tail of the previous chunk fades out:
-
-```
-  Previous chunk:  ████████████████╲____
-  New chunk:       ____╱████████████████
-                       ├─crossfade─┤
-                          0.5 sec
-```
+**Audio crossfading** (in `synthesizer.py`) applies a cosine taper to the start and end of each audio chunk, preventing clicks at phase discontinuities where one buffer ends and the next begins. The **Smoothness** slider controls the taper length: 0 = longer 40ms fade (softer, more audible dip); 1 = minimal 2ms taper (seamless, nearly imperceptible).
 
 ---
 
@@ -452,7 +520,7 @@ The three layers are combined at their configured levels, passed through a globa
 
 ---
 
-## Configuration (`config.py`)
+## Configuration (`src/mulchy/config.py`)
 
 All parameters are in one file. Key knobs:
 
@@ -466,21 +534,8 @@ All parameters are in one file. Key knobs:
 | `GLITCH_LOW_PASS_HZ` | Cutoff to tame glitch harshness |
 
 ### Presets
-Three presets are included: `ambient`, `glitchy`, `percussive`. Add your own to the `PRESETS` dict in `config.py`.
 
----
-
-## Extending
-
-### Adding GPIO buttons
-1. Wire button to GPIO pin (see commented pin assignments in `config.py`)
-2. Uncomment `_setup_gpio()` in `main.py`
-3. Hook into the main loop: freeze frame, cycle presets, save snapshot
-
-### Adding a display
-1. Wire SSD1306 / small TFT
-2. Uncomment display config in `config.py`
-3. Call `_update_display(features)` in the main loop
+Four presets are included: `default`, `ambient`, `glitchy`, `percussive`. Add your own to the `PRESETS` dict in `src/mulchy/config.py`, or clone and save one from the web dashboard.
 
 ---
 
@@ -508,17 +563,6 @@ sudo systemctl enable --now mulchy-wifi.service
 
 ---
 
-## Systemd (runs on boot)
-
-```bash
-sudo systemctl start mulchy     # start now
-sudo systemctl stop mulchy      # stop
-sudo systemctl status mulchy    # check status
-journalctl -u mulchy -f         # live logs
-```
-
----
-
 ## Pi Hardware Setup
 
 Everything below was configured directly on the Pi and is **not in the repo**. If the OS is re-flashed, these steps need to be repeated.
@@ -530,16 +574,9 @@ sudo hostnamectl set-hostname mulchy
 # Makes the Pi reachable at mulchy.local on the local network
 ```
 
-### 2. Python dependencies
+### 2. Main app service
 
-```bash
-pip install flask picamera2 numpy scipy
-# Installed to /home/pi/.local/lib/python3.x/site-packages/
-```
-
-### 3. Main app service
-
-`/etc/systemd/system/mulchy.service`:
+`install.sh` creates and enables this automatically. The installed service file (`/etc/systemd/system/mulchy.service`) looks like:
 
 ```ini
 [Unit]
@@ -553,7 +590,7 @@ User=pi
 WorkingDirectory=/home/pi/mulchy
 ExecStartPre=/bin/sleep 3
 ExecStartPre=/usr/bin/amixer -c 1 sset PCM 100%
-ExecStart=/usr/bin/python3 /home/pi/mulchy/main.py
+ExecStart=/home/pi/.local/bin/uv run --directory /home/pi/mulchy mulchy --preset ambient
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -563,12 +600,7 @@ StandardError=journal
 WantedBy=multi-user.target
 ```
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now mulchy.service
-```
-
-### 4. WiFi watchdog service
+### 3. WiFi watchdog service
 
 `/etc/systemd/system/mulchy-wifi.service`:
 
@@ -580,7 +612,7 @@ Wants=NetworkManager.service
 
 [Service]
 Type=simple
-ExecStart=/home/pi/mulchy/wifi_monitor.sh
+ExecStart=/home/pi/mulchy/scripts/wifi_monitor.sh
 Restart=always
 RestartSec=5
 
@@ -594,7 +626,7 @@ sudo systemctl daemon-reload
 # sudo systemctl enable --now mulchy-wifi.service
 ```
 
-### 5. Sudoers — nmcli and iwlist
+### 4. Sudoers — nmcli and iwlist
 
 The app runs as `pi` but needs to control NetworkManager and run WiFi scans.
 
@@ -613,7 +645,7 @@ sudo visudo -f /etc/sudoers.d/mulchy-nmcli
 sudo visudo -f /etc/sudoers.d/mulchy-iwlist
 ```
 
-### 6. NetworkManager AP profile
+### 5. NetworkManager AP profile
 
 Creates the `mulchywifi` hotspot used when no client connection is available.
 
@@ -633,7 +665,7 @@ sudo nmcli con modify mulchy-ap ipv4.addresses 10.42.0.1/24
 sudo nmcli con modify mulchy-ap connection.autoconnect no
 ```
 
-### 7. WiFi country code
+### 6. WiFi country code
 
 ```bash
 sudo raspi-config nonint do_wifi_country US

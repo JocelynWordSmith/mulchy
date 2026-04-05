@@ -65,6 +65,24 @@ RHYTHM_HAT_HZ   = 8000
 # DISPLAY_WIDTH   = 128
 # DISPLAY_HEIGHT  = 64
 
+# ─── Feature Smoothing ────────────────────────────────────────────────────────
+FEATURE_SMOOTHING = 0.3    # EMA alpha for feature smoothing (0=frozen, 1=raw, lower=smoother)
+
+# ─── Color Clustering ────────────────────────────────────────────────────────
+COLOR_CLUSTER_SAMPLES = 1000  # max pixels to subsample for KMeans clustering
+
+# ─── Effects (pedalboard) ────────────────────────────────────────────────────
+FX_REVERB_ENABLED        = True
+FX_REVERB_ROOM_SIZE      = 0.3     # 0.0–1.0
+FX_REVERB_WET            = 0.2     # 0.0–1.0
+FX_CHORUS_ENABLED        = False
+FX_CHORUS_RATE           = 1.5     # Hz
+FX_CHORUS_DEPTH          = 0.25    # 0.0–1.0
+FX_CHORUS_MIX            = 0.15    # 0.0–1.0
+FX_COMPRESSOR_ENABLED    = True
+FX_COMPRESSOR_THRESHOLD  = -15.0   # dB
+FX_COMPRESSOR_RATIO      = 3.0
+
 # ─── Motion ───────────────────────────────────────────────────────────────────
 MOTION_SENSITIVITY     = 1.5  # scales raw frame-diff into 0–1 motion_amount
 MOTION_PITCH_SEMITONES = 7    # max pitch bend (±semitones) from horizontal motion
@@ -94,6 +112,17 @@ PRESETS = {
         "MOTION_PITCH_SEMITONES": 7,
         "MOTION_TEMPO_SCALE": 0.5,
         "CROSSFADE_SMOOTHNESS": 0.0,
+        "FEATURE_SMOOTHING": 0.3,
+        "FX_REVERB_ENABLED": True,
+        "FX_REVERB_ROOM_SIZE": 0.3,
+        "FX_REVERB_WET": 0.2,
+        "FX_CHORUS_ENABLED": False,
+        "FX_CHORUS_RATE": 1.5,
+        "FX_CHORUS_DEPTH": 0.25,
+        "FX_CHORUS_MIX": 0.15,
+        "FX_COMPRESSOR_ENABLED": True,
+        "FX_COMPRESSOR_THRESHOLD": -12.0,
+        "FX_COMPRESSOR_RATIO": 3.0,
     },
     # Slow, warm drone. Good for calm scenes or background listening.
     # Glitch off, tonal dominant, soft rhythm, warm low-pass, wide pitch range.
@@ -117,6 +146,17 @@ PRESETS = {
         "MOTION_PITCH_SEMITONES": 12,
         "MOTION_TEMPO_SCALE": 0.3,
         "CROSSFADE_SMOOTHNESS": 0.7,
+        "FEATURE_SMOOTHING": 0.2,
+        "FX_REVERB_ENABLED": True,
+        "FX_REVERB_ROOM_SIZE": 0.6,
+        "FX_REVERB_WET": 0.4,
+        "FX_CHORUS_ENABLED": True,
+        "FX_CHORUS_RATE": 1.0,
+        "FX_CHORUS_DEPTH": 0.3,
+        "FX_CHORUS_MIX": 0.2,
+        "FX_COMPRESSOR_ENABLED": True,
+        "FX_COMPRESSOR_THRESHOLD": -18.0,
+        "FX_COMPRESSOR_RATIO": 2.0,
     },
     # Harsh, reactive, noisy. Glitch layer dominant, fast frames, bright mix.
     # Moving camera causes radical pitch and tempo shifts.
@@ -140,6 +180,17 @@ PRESETS = {
         "MOTION_PITCH_SEMITONES": 14,
         "MOTION_TEMPO_SCALE": 0.8,
         "CROSSFADE_SMOOTHNESS": 0.0,
+        "FEATURE_SMOOTHING": 0.6,
+        "FX_REVERB_ENABLED": False,
+        "FX_REVERB_ROOM_SIZE": 0.1,
+        "FX_REVERB_WET": 0.1,
+        "FX_CHORUS_ENABLED": False,
+        "FX_CHORUS_RATE": 1.5,
+        "FX_CHORUS_DEPTH": 0.25,
+        "FX_CHORUS_MIX": 0.15,
+        "FX_COMPRESSOR_ENABLED": True,
+        "FX_COMPRESSOR_THRESHOLD": -8.0,
+        "FX_COMPRESSOR_RATIO": 6.0,
     },
     # Tight, punchy drums driven by image texture. Minimal glitch, narrow tonal range.
     # Works best with high-contrast scenes with repeated patterns.
@@ -163,6 +214,17 @@ PRESETS = {
         "MOTION_PITCH_SEMITONES": 5,
         "MOTION_TEMPO_SCALE": 0.7,
         "CROSSFADE_SMOOTHNESS": 0.0,
+        "FEATURE_SMOOTHING": 0.4,
+        "FX_REVERB_ENABLED": True,
+        "FX_REVERB_ROOM_SIZE": 0.15,
+        "FX_REVERB_WET": 0.15,
+        "FX_CHORUS_ENABLED": False,
+        "FX_CHORUS_RATE": 1.5,
+        "FX_CHORUS_DEPTH": 0.25,
+        "FX_CHORUS_MIX": 0.15,
+        "FX_COMPRESSOR_ENABLED": True,
+        "FX_COMPRESSOR_THRESHOLD": -10.0,
+        "FX_COMPRESSOR_RATIO": 4.0,
     },
 }
 

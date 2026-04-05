@@ -14,8 +14,6 @@ import signal
 import sys
 import time
 
-import numpy as np
-
 from mulchy import config as cfg
 from mulchy import web
 from mulchy.analyzer import analyze
@@ -51,7 +49,6 @@ class Mulchy:
         self._running = False
         self._cam = Camera(source if source is not None else make_source(None))
         self._player = player if player is not None else SoundDevicePlayer()
-        self._prev_frame: np.ndarray | None = None
         web.run(preset=preset)
 
         signal.signal(signal.SIGINT,  self._handle_signal)
@@ -76,9 +73,8 @@ class Mulchy:
 
             # ── Analyse ───────────────────────────────────────────────────
             t1 = time.monotonic()
-            features = analyze(frame, prev_frame=self._prev_frame)
+            features = analyze(frame)
             analyze_ms = (time.monotonic() - t1) * 1000
-            self._prev_frame = frame
 
             # ── Synthesise ────────────────────────────────────────────────
             t2 = time.monotonic()

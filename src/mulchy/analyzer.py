@@ -44,6 +44,12 @@ class ImageFeatures(TypedDict):
 
 _row_idx_cache: dict = {}   # h → row_indices array
 _coord_cache: dict   = {}   # (h, w) → (xs, ys) for motion centroid
+_prev_gray: np.ndarray | None = None  # cached gray from previous frame
+_prev_features: dict | None = None    # cached features for EMA smoothing
+
+# Features to smooth with EMA (excludes scanlines, texture_scores, motion_cx/cy)
+_SMOOTH_KEYS = ("brightness", "saturation", "edge_density",
+                "luminance_mean", "luminance_variance", "motion_amount")
 
 
 def analyze(frame_rgb: np.ndarray, prev_frame: np.ndarray = None) -> ImageFeatures:
@@ -63,11 +69,11 @@ def analyze(frame_rgb: np.ndarray, prev_frame: np.ndarray = None) -> ImageFeatur
         _row_idx_cache[h] = np.linspace(0, h - 1, cfg.GLITCH_SCANLINES, dtype=int)
     scanlines = [gray[_row_idx_cache[h][i], :].tolist() for i in range(cfg.GLITCH_SCANLINES)]
 
-    # ── Hue clustering (simple histogram → top-N peaks) ───────────────────────
+    # ── Hue clustering ────────────────────────────────────────────────────────
     hue_mask = hsv[..., 1] > 0.15   # ignore near-grey pixels
-    hues = hsv[..., 0][hue_mask]    # 0–1 range (we'll work in 0–360 later)
-
-    hue_centers, hue_weights = _cluster_hues(hues, cfg.TONAL_NUM_VOICES)
+    hue_centers, hue_weights = _cluster_colors_kmeans(
+        frame_float, hue_mask, cfg.TONAL_NUM_VOICES
+    )
 
     # ── Texture repetition (FFT of each quadrant) ─────────────────────────────
     texture_scores = _texture_scores(gray)
@@ -78,9 +84,16 @@ def analyze(frame_rgb: np.ndarray, prev_frame: np.ndarray = None) -> ImageFeatur
     edge_density = _edge_density(gray)
     luminance_variance = float(np.var(gray))
 
-    motion_amount, motion_cx, motion_cy = _motion_features(gray, h, w, prev_frame)
+    global _prev_gray
+    # Use cached prev_gray when prev_frame not explicitly provided
+    if prev_frame is not None:
+        prev_g = _to_gray(prev_frame.astype(np.float32) / 255.0)
+    else:
+        prev_g = _prev_gray
+    motion_amount, motion_cx, motion_cy = _motion_features(gray, h, w, prev_g)
+    _prev_gray = gray
 
-    return ImageFeatures(
+    features = ImageFeatures(
         scanlines=scanlines,
         hue_centers=[c * 360.0 for c in hue_centers],  # convert 0–1 → 0–360°
         hue_weights=hue_weights,
@@ -95,8 +108,47 @@ def analyze(frame_rgb: np.ndarray, prev_frame: np.ndarray = None) -> ImageFeatur
         motion_cy=motion_cy,
     )
 
+    return _smooth_features(features)
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _smooth_features(features: ImageFeatures) -> ImageFeatures:
+    """Apply EMA smoothing to selected features for frame-to-frame consistency."""
+    global _prev_features
+    alpha = cfg.FEATURE_SMOOTHING
+    if _prev_features is None or alpha >= 1.0:
+        _prev_features = dict(features)
+        return features
+
+    smoothed = dict(features)
+
+    # Smooth scalar features with standard EMA
+    for key in _SMOOTH_KEYS:
+        smoothed[key] = alpha * features[key] + (1.0 - alpha) * _prev_features[key]
+
+    # Smooth hue_weights with standard EMA
+    smoothed["hue_weights"] = [
+        alpha * w + (1.0 - alpha) * pw
+        for w, pw in zip(features["hue_weights"], _prev_features["hue_weights"])
+    ]
+    # Renormalize weights
+    wt = sum(smoothed["hue_weights"]) or 1.0
+    smoothed["hue_weights"] = [w / wt for w in smoothed["hue_weights"]]
+
+    # Smooth hue_centers with circular averaging (avoid 0/360 wraparound)
+    smoothed_hues = []
+    for h_new, h_prev in zip(features["hue_centers"], _prev_features["hue_centers"]):
+        rad_new = np.radians(h_new)
+        rad_prev = np.radians(h_prev)
+        cx = alpha * np.cos(rad_new) + (1.0 - alpha) * np.cos(rad_prev)
+        cy = alpha * np.sin(rad_new) + (1.0 - alpha) * np.sin(rad_prev)
+        smoothed_hues.append(float(np.degrees(np.arctan2(cy, cx)) % 360.0))
+    smoothed["hue_centers"] = smoothed_hues
+
+    _prev_features = dict(smoothed)
+    return ImageFeatures(**smoothed)
+
 
 def _to_gray(frame_float: np.ndarray) -> np.ndarray:
     """BT.601 luma from float32 RGB (H×W×3, values 0–1)."""
@@ -164,6 +216,61 @@ def _cluster_hues(hues_01: np.ndarray, n: int):
     return centers, weights
 
 
+_MiniBatchKMeans = None  # deferred import
+
+
+def _cluster_colors_kmeans(frame_float: np.ndarray, hue_mask: np.ndarray,
+                           n: int):
+    """
+    KMeans clustering on RGB pixels for perceptually better color detection.
+    Falls back to histogram method when too few saturated pixels.
+    Returns (centers_01, weights) each of length n — hue centers in 0–1 range.
+    """
+    global _MiniBatchKMeans
+    pixels = frame_float[hue_mask]
+
+    if len(pixels) < n:
+        # Too few saturated pixels — fall back to histogram
+        hsv = _rgb_to_hsv(frame_float)
+        hues = hsv[..., 0][hue_mask]
+        return _cluster_hues(hues, n)
+
+    # Deferred import to avoid slow sklearn load at startup
+    if _MiniBatchKMeans is None:
+        from sklearn.cluster import MiniBatchKMeans
+        _MiniBatchKMeans = MiniBatchKMeans
+
+    # Subsample for speed
+    max_samples = cfg.COLOR_CLUSTER_SAMPLES
+    rng = np.random.default_rng(42)
+    if len(pixels) > max_samples:
+        idx = rng.choice(len(pixels), max_samples, replace=False)
+        pixels = pixels[idx]
+
+    km = _MiniBatchKMeans(n_clusters=n, batch_size=256, n_init=1,
+                          max_iter=10, random_state=42)
+    km.fit(pixels)
+
+    # Convert RGB cluster centers to HSV hue
+    centers_rgb = km.cluster_centers_.astype(np.float32)
+    # Reshape to (1, n, 3) for _rgb_to_hsv, then extract hues
+    centers_hsv = _rgb_to_hsv(centers_rgb.reshape(1, -1, 3))
+    hue_centers = centers_hsv[0, :, 0].tolist()  # 0–1 range
+
+    # Weights = proportion of pixels per cluster
+    labels = km.labels_
+    counts = np.bincount(labels, minlength=n).astype(float)
+    total = counts.sum() or 1.0
+    weights = (counts / total).tolist()
+
+    # Sort by weight descending
+    paired = sorted(zip(weights, hue_centers), reverse=True)
+    weights = [p[0] for p in paired]
+    hue_centers = [p[1] for p in paired]
+
+    return hue_centers, weights
+
+
 def _texture_scores(gray: np.ndarray) -> list:
     """
     Measure repetitiveness in each quadrant using 2-D FFT.
@@ -182,11 +289,12 @@ def _texture_scores(gray: np.ndarray) -> list:
         if q.size == 0:
             scores.append(0.0)
             continue
-        fft = np.fft.fft2(q)
-        mag = np.abs(np.fft.fftshift(fft))
-        # Exclude DC component (centre)
-        cy, cx = mag.shape[0] // 2, mag.shape[1] // 2
-        mag[cy, cx] = 0
+        # Downsample for speed, then use rfft2 (real input → ~half the output)
+        q_ds = q[::2, ::2]
+        fft = np.fft.rfft2(q_ds)
+        mag = np.abs(np.fft.fftshift(fft, axes=0))
+        # DC component in shifted rfft2 output
+        mag[mag.shape[0] // 2, 0] = 0
         # Repetition score: energy in discrete peaks vs total energy
         total = np.sum(mag) + 1e-9
         threshold = np.percentile(mag, 95)
@@ -197,13 +305,14 @@ def _texture_scores(gray: np.ndarray) -> list:
 
 def _edge_density(gray: np.ndarray) -> float:
     """Sobel edge density, normalised 0–1."""
-    sx = ndimage.sobel(gray, axis=1)
-    sy = ndimage.sobel(gray, axis=0)
+    gray_ds = gray[::2, ::2]
+    sx = ndimage.sobel(gray_ds, axis=1)
+    sy = ndimage.sobel(gray_ds, axis=0)
     magnitude = np.hypot(sx, sy)
     return float(np.clip(np.mean(magnitude) * 4.0, 0.0, 1.0))
 
 
-def _motion_features(gray: np.ndarray, h: int, w: int, prev_frame) -> tuple:
+def _motion_features(gray: np.ndarray, h: int, w: int, prev_gray) -> tuple:
     """
     Compute motion amount and spatial centre of motion vs the previous frame.
     Returns (motion_amount, motion_cx, motion_cy).
@@ -211,10 +320,9 @@ def _motion_features(gray: np.ndarray, h: int, w: int, prev_frame) -> tuple:
       motion_cx     : -1 (left-heavy motion) to +1 (right-heavy)
       motion_cy     : -1 (top-heavy)  to +1 (bottom-heavy)
     """
-    if prev_frame is None:
+    if prev_gray is None:
         return 0.0, 0.0, 0.0
 
-    prev_gray = _to_gray(prev_frame.astype(np.float32) / 255.0)
     diff = np.abs(gray - prev_gray)
 
     raw    = float(np.mean(diff))

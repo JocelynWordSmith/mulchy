@@ -5,6 +5,7 @@ Three layers: glitch (raw scanline), tonal (hue→pitch), rhythm (texture→drum
 """
 
 import numpy as np
+from pedalboard import Chorus, Compressor, Pedalboard, Reverb
 from scipy.signal import butter, sosfilt
 
 from mulchy import config as cfg
@@ -14,6 +15,62 @@ from mulchy.analyzer import ImageFeatures
 # Butterworth design is expensive; cache by (rounded) cutoff frequency.
 _lp_sos_cache: dict  = {}   # hz_key → sos coefficients
 _adsr_cache: dict    = {}   # n_samples → envelope array
+_time_cache: dict    = {}   # n_samples → time array
+_arange_cache: dict  = {}   # n_samples → np.arange(n) int array
+_taper_cache: dict   = {}   # taper_n → cosine taper array
+_noise_buf: np.ndarray = np.random.default_rng(42).uniform(-1.0, 1.0, 44100)
+
+# ── Synth state (persists across frames) ─────────────────────────────────────
+_tonal_phases: dict[int, float] = {}   # voice_idx → phase in radians
+_prev_tail: np.ndarray | None = None   # last overlap_n samples for crossfade
+
+
+_fx_board: Pedalboard | None = None
+_fx_config_hash: tuple | None = None
+
+
+def reset_synth_state():
+    """Clear all stateful synth data. Call between tests."""
+    global _prev_tail, _fx_board, _fx_config_hash
+    _tonal_phases.clear()
+    _prev_tail = None
+    _fx_board = None
+    _fx_config_hash = None
+
+
+def _get_fx_board() -> Pedalboard | None:
+    """Build or return cached pedalboard effects chain. Returns None if all FX disabled."""
+    global _fx_board, _fx_config_hash
+    current_hash = (
+        cfg.FX_REVERB_ENABLED, cfg.FX_REVERB_ROOM_SIZE, cfg.FX_REVERB_WET,
+        cfg.FX_CHORUS_ENABLED, cfg.FX_CHORUS_RATE, cfg.FX_CHORUS_DEPTH, cfg.FX_CHORUS_MIX,
+        cfg.FX_COMPRESSOR_ENABLED, cfg.FX_COMPRESSOR_THRESHOLD, cfg.FX_COMPRESSOR_RATIO,
+    )
+    if current_hash == _fx_config_hash:
+        return _fx_board
+
+    plugins = []
+    if cfg.FX_CHORUS_ENABLED:
+        plugins.append(Chorus(
+            rate_hz=cfg.FX_CHORUS_RATE,
+            depth=cfg.FX_CHORUS_DEPTH,
+            mix=cfg.FX_CHORUS_MIX,
+        ))
+    if cfg.FX_REVERB_ENABLED:
+        plugins.append(Reverb(
+            room_size=cfg.FX_REVERB_ROOM_SIZE,
+            wet_level=cfg.FX_REVERB_WET,
+            dry_level=1.0 - cfg.FX_REVERB_WET,
+        ))
+    if cfg.FX_COMPRESSOR_ENABLED:
+        plugins.append(Compressor(
+            threshold_db=cfg.FX_COMPRESSOR_THRESHOLD,
+            ratio=cfg.FX_COMPRESSOR_RATIO,
+        ))
+
+    _fx_board = Pedalboard(plugins) if plugins else None
+    _fx_config_hash = current_hash
+    return _fx_board
 
 
 def _get_sos(hz: float, order: int = 2) -> np.ndarray:
@@ -28,6 +85,24 @@ def _get_adsr(n: int) -> np.ndarray:
     if n not in _adsr_cache:
         _adsr_cache[n] = _adsr(n, attack=0.20, decay=0.05, sustain=0.85, release=0.10)
     return _adsr_cache[n]
+
+
+def _get_time(n: int) -> np.ndarray:
+    if n not in _time_cache:
+        _time_cache[n] = np.arange(n, dtype=np.float64) / cfg.SAMPLE_RATE
+    return _time_cache[n]
+
+
+def _get_arange(n: int) -> np.ndarray:
+    if n not in _arange_cache:
+        _arange_cache[n] = np.arange(n)
+    return _arange_cache[n]
+
+
+def _get_taper(taper_n: int) -> np.ndarray:
+    if taper_n not in _taper_cache:
+        _taper_cache[taper_n] = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, taper_n)))
+    return _taper_cache[taper_n]
 
 
 def synthesize(features: ImageFeatures) -> np.ndarray:
@@ -54,19 +129,35 @@ def synthesize(features: ImageFeatures) -> np.ndarray:
                           300, cfg.SAMPLE_RATE // 2 - 100))
     mixed = sosfilt(_get_sos(lp_hz), mixed)
 
+    # Apply pedalboard effects chain (reverb, chorus, compressor)
+    fx = _get_fx_board()
+    if fx is not None:
+        mixed_f32 = mixed.astype(np.float32).reshape(1, -1)
+        mixed_f32 = fx(mixed_f32, cfg.SAMPLE_RATE)
+        mixed = mixed_f32[0].astype(np.float64)
+
     # Gentle peak normalise — no saturation distortion
     peak = np.max(np.abs(mixed)) + 1e-9
     if peak > 0.0:
         mixed = mixed / peak * 0.85
     mixed *= cfg.MASTER_VOLUME
 
-    # Cosine taper at both ends — prevents clicks from phase discontinuities between buffers.
-    # CROSSFADE_SMOOTHNESS=0 → 40ms taper (audible ~80ms dip); =1 → 2ms (perceptually seamless).
+    # Overlap-add crossfading — blends the tail of the previous chunk with
+    # the head of the new one, eliminating amplitude dips at boundaries.
+    global _prev_tail
     taper_ms = max(2.0, 40.0 * (1.0 - cfg.CROSSFADE_SMOOTHNESS))
     taper_n = min(int(cfg.SAMPLE_RATE * taper_ms / 1000.0), n_samples // 8)
-    taper   = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, taper_n)))
-    mixed[:taper_n]  *= taper         # fade in
-    mixed[-taper_n:] *= taper[::-1]   # fade out
+    taper = _get_taper(taper_n)
+
+    if _prev_tail is not None and len(_prev_tail) == taper_n:
+        # Crossfade: blend previous tail (fading out) with current head (fading in)
+        mixed[:taper_n] = _prev_tail * taper[::-1] + mixed[:taper_n] * taper
+    else:
+        # First chunk: just fade in
+        mixed[:taper_n] *= taper
+
+    # Store tail for next frame's crossfade (no fade-out applied to output)
+    _prev_tail = mixed[-taper_n:].copy()
 
     return mixed.astype(np.float32)
 
@@ -92,7 +183,7 @@ def _layer_glitch(features: ImageFeatures, n_samples: int) -> np.ndarray:
         # Motion makes the glitch layer speed up / pitch-shift more
         pitch = cfg.GLITCH_PITCH_SHIFT * (1.0 + i * 0.03 + motion * 0.5)
         stretched_len = max(1, int(len(row_arr) / pitch))
-        indices = (np.arange(n_samples) % stretched_len).astype(int)
+        indices = (_get_arange(n_samples) % stretched_len).astype(int)
         tiled = row_arr[np.clip(indices, 0, len(row_arr) - 1)]
 
         # Modulate amplitude by image brightness variance
@@ -111,7 +202,7 @@ def _layer_tonal(features: ImageFeatures, n_samples: int) -> np.ndarray:
     Each dominant hue maps to a pitch on a pentatonic scale.
     Weight = how dominant that colour is → amplitude of that oscillator.
     """
-    t = np.arange(n_samples, dtype=np.float64) / cfg.SAMPLE_RATE
+    t = _get_time(n_samples)
     result = np.zeros(n_samples, dtype=np.float64)
 
     scale = cfg.TONAL_SCALE_SEMITONES
@@ -153,16 +244,26 @@ def _layer_tonal(features: ImageFeatures, n_samples: int) -> np.ndarray:
         detune_hz = _semitones_to_ratio(cfg.TONAL_DETUNE_CENTS / 100.0)
         freq = base_freq * _semitones_to_ratio(semitone) * pitch_bend_ratio
 
+        # Phase-continuous oscillator — carry phase across frames
+        main_phase_key = voice_idx
+        detune_phase_key = voice_idx + 1000
+        start_phase = _tonal_phases.get(main_phase_key, 0.0)
+        detune_start = _tonal_phases.get(detune_phase_key, 0.0)
+
         if cfg.TONAL_WAVEFORM == "sine":
             # Vibrato via cumulative phase modulation (LFO-FM)
-            phase = 2.0 * np.pi * freq * np.cumsum(lfo) / cfg.SAMPLE_RATE
+            phase = start_phase + 2.0 * np.pi * freq * np.cumsum(lfo) / cfg.SAMPLE_RATE
             wave = np.sin(phase)
+            _tonal_phases[main_phase_key] = float(phase[-1] % (2.0 * np.pi))
         else:
-            wave = _oscillator(cfg.TONAL_WAVEFORM, freq, t)
+            wave, end_phase = _oscillator(cfg.TONAL_WAVEFORM, freq, t, start_phase)
+            _tonal_phases[main_phase_key] = end_phase
 
-        # Add slightly detuned copy
-        wave += _oscillator(cfg.TONAL_WAVEFORM, freq * detune_hz, t) * 0.4
+        # Add slightly detuned copy with its own phase continuity
+        detune_wave, detune_end = _oscillator(cfg.TONAL_WAVEFORM, freq * detune_hz, t, detune_start)
+        wave += detune_wave * 0.4
         wave /= 1.4  # normalise after detune
+        _tonal_phases[detune_phase_key] = detune_end
 
         amp_env = _get_adsr(n_samples) * (weight * (0.4 + features["saturation"] * 0.6))
 
@@ -171,17 +272,23 @@ def _layer_tonal(features: ImageFeatures, n_samples: int) -> np.ndarray:
     return result / n_active_voices
 
 
-def _oscillator(shape: str, freq: float, t: np.ndarray) -> np.ndarray:
-    phase = 2.0 * np.pi * freq * t
+def _oscillator(shape: str, freq: float, t: np.ndarray,
+                start_phase: float = 0.0) -> tuple[np.ndarray, float]:
+    """Generate waveform with phase continuity. Returns (waveform, end_phase)."""
+    phase = start_phase + 2.0 * np.pi * freq * t
+    end_phase = float(phase[-1] % (2.0 * np.pi)) if len(phase) > 0 else start_phase
     if shape == "sine":
-        return np.sin(phase)
+        return np.sin(phase), end_phase
     elif shape == "triangle":
-        return 2.0 * np.abs(2.0 * (t * freq - np.floor(t * freq + 0.5))) - 1.0
+        # Use phase-based triangle for continuity
+        p_norm = (phase / (2.0 * np.pi)) % 1.0
+        return 2.0 * np.abs(2.0 * p_norm - 1.0) - 1.0, end_phase
     elif shape == "sawtooth":
-        return 2.0 * (t * freq - np.floor(t * freq + 0.5))
+        p_norm = (phase / (2.0 * np.pi)) % 1.0
+        return 2.0 * p_norm - 1.0, end_phase
     elif shape == "square":
-        return np.sign(np.sin(phase))
-    return np.sin(phase)
+        return np.sign(np.sin(phase)), end_phase
+    return np.sin(phase), end_phase
 
 
 def _adsr(n: int, attack: float, decay: float,
@@ -266,11 +373,11 @@ def _add_hit(buf: np.ndarray, start: int, total: int,
     if n <= 0:
         return buf
 
-    t = np.arange(n, dtype=np.float64) / cfg.SAMPLE_RATE
+    t = _get_time(n)
     env = np.exp(-t / (decay_ms / 1000.0 * 0.3))
 
     tone  = np.sin(2.0 * np.pi * freq * t)
-    noise = np.random.uniform(-1.0, 1.0, n)
+    noise = _noise_buf[:n]
 
     hit = tone * (1.0 - noise_mix) + noise * noise_mix
     hit *= env * velocity

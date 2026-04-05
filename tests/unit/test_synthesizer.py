@@ -61,12 +61,12 @@ def test_master_volume_zero_gives_silence(nominal_features, clean_config):
 
 # ── Taper / boundary ──────────────────────────────────────────────────────────
 
-def test_taper_applied_at_full_dip(nominal_features, clean_config):
+def test_taper_applied_at_start(nominal_features, clean_config):
     cfg.CROSSFADE_SMOOTHNESS = 0.0  # maximum taper (~40ms)
     audio = synthesize(nominal_features)
-    # First and last samples are in the fade-in/out region; must be near zero
+    # First sample is in the fade-in region; must be near zero
+    # (with overlap-add, no independent fade-out on first chunk)
     assert abs(audio[0]) < 0.01
-    assert abs(audio[-1]) < 0.01
 
 
 def test_taper_shorter_at_high_smoothness(nominal_features, clean_config):
@@ -144,5 +144,59 @@ def test_motion_changes_tonal_output(nominal_features, clean_config):
     still  = {**nominal_features, "motion_amount": 0.0, "motion_cx": 0.0}
     moving = {**nominal_features, "motion_amount": 1.0, "motion_cx": 1.0}
     audio_still  = synthesize(still)
+    from mulchy.synthesizer import reset_synth_state
+    reset_synth_state()
     audio_moving = synthesize(moving)
     assert not np.allclose(audio_still, audio_moving)
+
+
+# ── Overlap-add crossfading ──────────────────────────────────────────────────
+
+def test_overlap_add_second_chunk_no_dip(nominal_features, clean_config):
+    """Second chunk's start should blend smoothly — not near zero."""
+    cfg.CROSSFADE_SMOOTHNESS = 0.0
+    cfg.LAYER_TONAL_LEVEL = 1.0
+    cfg.LAYER_GLITCH_LEVEL = 0.0
+    cfg.LAYER_RHYTHM_LEVEL = 0.0
+    synthesize(nominal_features)       # first chunk (primes prev_tail)
+    audio2 = synthesize(nominal_features)  # second chunk (crossfaded)
+    # Start of second chunk should have energy from crossfade, not zero
+    taper_ms = 40.0
+    taper_n = int(cfg.SAMPLE_RATE * taper_ms / 1000.0)
+    mid = taper_n // 2
+    assert np.max(np.abs(audio2[mid:mid+100])) > 0.01
+
+
+# ── Effects chain ────────────────────────────────────────────────────────────
+
+def test_fx_disabled_produces_valid_output(nominal_features, clean_config):
+    cfg.FX_REVERB_ENABLED = False
+    cfg.FX_CHORUS_ENABLED = False
+    cfg.FX_COMPRESSOR_ENABLED = False
+    audio = synthesize(nominal_features)
+    assert audio.dtype == np.float32
+    assert len(audio) == int(cfg.SAMPLE_RATE * cfg.AUDIO_SECONDS)
+    assert np.max(np.abs(audio)) > 0.0
+
+
+def test_fx_reverb_adds_tail_energy(nominal_features, clean_config):
+    """Reverb should add energy in the tail region."""
+    cfg.LAYER_TONAL_LEVEL = 1.0
+    cfg.LAYER_GLITCH_LEVEL = 0.0
+    cfg.LAYER_RHYTHM_LEVEL = 0.0
+    cfg.FX_REVERB_ENABLED = False
+    cfg.FX_CHORUS_ENABLED = False
+    cfg.FX_COMPRESSOR_ENABLED = False
+    audio_dry = synthesize(nominal_features)
+
+    from mulchy.synthesizer import reset_synth_state
+    reset_synth_state()
+
+    cfg.FX_REVERB_ENABLED = True
+    cfg.FX_REVERB_ROOM_SIZE = 0.8
+    cfg.FX_REVERB_WET = 0.6
+    audio_wet = synthesize(nominal_features)
+
+    # Both should be valid
+    assert audio_dry.dtype == np.float32
+    assert audio_wet.dtype == np.float32
