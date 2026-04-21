@@ -25,6 +25,7 @@ except ImportError:
 import pathlib
 
 from mulchy import config as cfg
+from mulchy.player import list_output_devices, set_default_sink
 
 log = logging.getLogger(__name__)
 app = Flask(__name__)
@@ -64,6 +65,7 @@ _active_preset  = "ambient"  # tracks which preset is loaded
 _custom_presets  = {}   # user-cloned presets; persisted to state.json
 _preset_settings = {}   # per-preset slider overrides; keyed by preset name
 _STATE_FILE      = _default_state_file()
+_player          = None  # set by run() — used for audio device switching
 
 
 def update(raw_frame, blended_frame, features, audio_chunk=None):
@@ -88,9 +90,10 @@ def update(raw_frame, blended_frame, features, audio_chunk=None):
         _cond.notify_all()
 
 
-def run(host="0.0.0.0", port=5000, preset="ambient"):
-    global _active_preset
+def run(host="0.0.0.0", port=5000, preset="ambient", player=None):
+    global _active_preset, _player
     _active_preset = preset
+    _player = player
     _load_state()
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     t = threading.Thread(
@@ -242,6 +245,48 @@ def preset_clone():
     })
 
 
+# ── Audio device management ───────────────────────────────────────────────────
+
+@app.route("/api/audio/devices")
+def audio_devices():
+    devices = list_output_devices()
+    # Find which device is currently the default
+    active = None
+    for d in devices:
+        if d.get("is_default"):
+            active = d["id"]
+            break
+    return jsonify({"devices": devices, "active": active})
+
+
+@app.route("/api/audio/device", methods=["POST"])
+def audio_device_set():
+    data = request.get_json(force=True)
+    device_id = data.get("device")
+    if device_id is None:
+        return jsonify({"error": "device id required"}), 400
+    result = set_default_sink(int(device_id))
+    return jsonify(result)
+
+
+# ── System power ───────────────────────────────────────────────────────────────
+
+@app.route("/api/system/shutdown", methods=["POST"])
+def system_shutdown():
+    """Power off the Pi. Requires NOPASSWD sudoers entry for /sbin/shutdown."""
+    try:
+        # Popen (not run) so the response returns before the Pi cuts power.
+        subprocess.Popen(
+            ["sudo", "/sbin/shutdown", "-h", "now"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        log.warning("Shutdown requested via web UI")
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.error("Shutdown failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ── Generators ─────────────────────────────────────────────────────────────────
 
 def _mjpeg():
@@ -306,6 +351,14 @@ def _serialise(features):
     return out
 
 
+def _get_active_sink_id():
+    """Return the PipeWire sink ID currently marked as default, or None."""
+    for d in list_output_devices():
+        if d.get("is_default"):
+            return d["id"]
+    return None
+
+
 _SETTINGS_META = [
     ("MASTER_VOLUME",          float, 0.0,  1.0),
     ("BLEND_ALPHA",            float, 0.05, 1.0),
@@ -355,6 +408,10 @@ def _load_state():
                 setattr(cfg, k, type(getattr(cfg, k))(v))
             except Exception:
                 pass
+    # Restore saved audio device (PipeWire default sink)
+    saved_device = state.get("audio_device")
+    if saved_device is not None:
+        set_default_sink(saved_device)
     log.info("State restored: preset=%s, %d custom preset(s)", _active_preset, len(_custom_presets))
 
 
@@ -366,6 +423,7 @@ def _save_state():
         "active_preset": _active_preset,
         "custom_presets": _custom_presets,
         "preset_settings": _preset_settings,
+        "audio_device": _get_active_sink_id(),
     }
     try:
         tmp = _STATE_FILE.with_suffix(".tmp")
@@ -938,6 +996,8 @@ header h1{font-size:.8rem;letter-spacing:.2em;color:#fff}
 .hbtn{background:none;border:1px solid #2a2a3e;color:#666;padding:5px 12px;border-radius:4px;cursor:pointer;font:inherit;font-size:.7rem;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
 .hbtn:active{opacity:.7}
 .hbtn.on{border-color:#7c5cfc;color:#9c7cff;background:#7c5cfc18}
+.hbtn.power{border-color:#3a2a2a;color:#ff6464}
+.hbtn.power:active{background:#ff646420}
 .dot{width:7px;height:7px;border-radius:50%;background:#333;flex-shrink:0}
 .dot.live{background:#50ff96}
 /* Main content */
@@ -991,6 +1051,7 @@ select{background:#141420;color:#aaa;border:1px solid #2a2a3e;padding:4px 6px;fo
     <button class="hbtn" id="overlay-btn" onclick="toggleOverlay()">Overlays</button>
     <button class="hbtn" id="audio-btn"   onclick="toggleAudio()">▶ Browser Audio</button>
     <button class="hbtn"                  onclick="openSheet()">⚙</button>
+    <button class="hbtn power" title="Power off" onclick="shutdownPi()">⏻</button>
     <div class="dot" id="dot"></div>
   </div>
 </header>
@@ -1267,6 +1328,23 @@ function buildSettings(vals){
   // Divider
   const div=document.createElement('div'); div.style.cssText='border-top:1px solid #1e1e2e;margin:4px 0';
   panel.appendChild(div);
+  // Audio output device selector
+  const arow=document.createElement('div'); arow.className='srow';
+  const albl=document.createElement('span'); albl.className='slabel'; albl.textContent='Output';
+  arow.appendChild(albl);
+  const asel=document.createElement('select'); asel.id='audio-device-select';
+  asel.innerHTML='<option value="">Loading...</option>';
+  asel.onchange=()=>switchAudioDevice(asel.value);
+  arow.appendChild(asel);
+  const arefresh=document.createElement('button'); arefresh.className='pbtn';
+  arefresh.style.cssText='font-size:.6rem;flex-shrink:0;padding:4px 8px';
+  arefresh.textContent='↻'; arefresh.onclick=()=>loadAudioDevices();
+  arow.appendChild(arefresh);
+  panel.appendChild(arow);
+  loadAudioDevices();
+  // Divider
+  const div2=document.createElement('div'); div2.style.cssText='border-top:1px solid #1e1e2e;margin:4px 0';
+  panel.appendChild(div2);
   SMETA.forEach(m=>{
     const row=document.createElement('div'); row.className='srow';
     const lbl=document.createElement('span'); lbl.className='slabel'; lbl.textContent=m.l;
@@ -1379,7 +1457,49 @@ function save(k,v){
   saveTimer=setTimeout(()=>{
     fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...pending})});
     Object.keys(pending).forEach(k=>delete pending[k]);
-  },300);
+  },50);
+}
+
+// ── Audio device ──────────────────────────────────────────────────────────────
+function loadAudioDevices(){
+  const sel=document.getElementById('audio-device-select');
+  if(!sel) return;
+  fetch('/api/audio/devices').then(r=>r.json()).then(d=>{
+    sel.innerHTML='';
+    if(!d.devices||!d.devices.length){
+      sel.innerHTML='<option value="">No devices found</option>';
+      return;
+    }
+    (d.devices||[]).forEach(dev=>{
+      const o=document.createElement('option');
+      o.value=dev.id; o.textContent=dev.name;
+      if(dev.is_default) o.selected=true;
+      sel.appendChild(o);
+    });
+  }).catch(()=>{sel.innerHTML='<option value="">Unavailable</option>';});
+}
+
+function switchAudioDevice(val){
+  if(!val) return;
+  fetch('/api/audio/device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device:parseInt(val)})})
+    .then(r=>r.json()).then(d=>{
+      if(!d.ok) alert('Failed to switch audio: '+(d.error||'unknown'));
+    });
+}
+
+// ── Power ─────────────────────────────────────────────────────────────────────
+function shutdownPi(){
+  if(!confirm('Power off the Pi now?\nWait ~20s for the green LED to stop blinking before unplugging.')) return;
+  fetch('/api/system/shutdown',{method:'POST'})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok){
+        document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;min-height:100dvh;color:#ff6464;font:13px/1.7 SF Mono,monospace;text-align:center;padding:20px">Shutting down...<br><span style="color:#555;font-size:.7rem">Wait for the green LED to stop blinking, then unplug.</span></div>';
+      } else {
+        alert('Shutdown failed: '+(d.error||'unknown. Check sudoers config.'));
+      }
+    }).catch(()=>{
+      document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;min-height:100dvh;color:#ff6464;font:13px/1.7 SF Mono,monospace;text-align:center;padding:20px">Shutting down...<br><span style="color:#555;font-size:.7rem">Wait for the green LED to stop blinking, then unplug.</span></div>';
+    });
 }
 </script>
 </body>

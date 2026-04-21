@@ -309,7 +309,9 @@ def _edge_density(gray: np.ndarray) -> float:
     sx = ndimage.sobel(gray_ds, axis=1)
     sy = ndimage.sobel(gray_ds, axis=0)
     magnitude = np.hypot(sx, sy)
-    return float(np.clip(np.mean(magnitude) * 4.0, 0.0, 1.0))
+    # Scale factor reduced from 4.0 to 3.0 to compensate for
+    # higher per-pixel edge magnitudes in the downsampled image.
+    return float(np.clip(np.mean(magnitude) * 3.0, 0.0, 1.0))
 
 
 def _motion_features(gray: np.ndarray, h: int, w: int, prev_gray) -> tuple:

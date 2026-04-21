@@ -49,7 +49,7 @@ class Mulchy:
         self._running = False
         self._cam = Camera(source if source is not None else make_source(None))
         self._player = player if player is not None else SoundDevicePlayer()
-        web.run(preset=preset)
+        web.run(preset=preset, player=self._player)
 
         signal.signal(signal.SIGINT,  self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)

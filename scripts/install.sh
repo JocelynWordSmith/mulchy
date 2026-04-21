@@ -42,6 +42,11 @@ if [ ! -f "$INSTALL_DIR/.env" ]; then
     cp "$INSTALL_DIR/.env.example" "$INSTALL_DIR/.env"
 fi
 
+# ── Sudoers: let pi user power off via web UI ─────────────────────────────────
+SUDOERS_SHUTDOWN="/etc/sudoers.d/mulchy-shutdown"
+echo "Installing sudoers entry for shutdown..."
+sudo install -m 0440 "$INSTALL_DIR/scripts/sudoers-mulchy-shutdown" "$SUDOERS_SHUTDOWN"
+
 # ── Systemd service ───────────────────────────────────────────────────────────
 SERVICE_FILE="/etc/systemd/system/mulchy.service"
 echo "Creating systemd service at $SERVICE_FILE..."

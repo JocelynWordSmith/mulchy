@@ -14,7 +14,7 @@ BLEND_ALPHA = 0.35
 
 # ─── Audio ────────────────────────────────────────────────────────────────────
 SAMPLE_RATE   = 44100
-AUDIO_SECONDS = 2.0        # duration of each generated audio chunk
+AUDIO_SECONDS = 1.0        # duration of each generated audio chunk (shorter = lower latency, more CPU)
 AUDIO_CHANNELS = 1         # mono for now; set to 2 for stereo later
 MASTER_VOLUME = 0.7        # 0.0–1.0
 CROSSFADE_SMOOTHNESS = 0.0 # 0.0 = 40ms taper dip at boundaries; 1.0 = ~2ms (seamless)
@@ -94,7 +94,7 @@ PRESETS = {
     # Balanced starting point — all three layers active at moderate levels.
     "default": {
         "BLEND_ALPHA": 0.45,
-        "AUDIO_SECONDS": 1.5,
+        "AUDIO_SECONDS": 0.75,
         "LAYER_GLITCH_LEVEL": 0.15,
         "LAYER_TONAL_LEVEL": 0.55,
         "LAYER_RHYTHM_LEVEL": 0.30,
@@ -128,7 +128,7 @@ PRESETS = {
     # Glitch off, tonal dominant, soft rhythm, warm low-pass, wide pitch range.
     "ambient": {
         "BLEND_ALPHA": 0.60,
-        "AUDIO_SECONDS": 1.5,
+        "AUDIO_SECONDS": 1.0,
         "LAYER_GLITCH_LEVEL": 0.0,
         "LAYER_TONAL_LEVEL": 0.75,
         "LAYER_RHYTHM_LEVEL": 0.10,
@@ -150,7 +150,7 @@ PRESETS = {
         "FX_REVERB_ENABLED": True,
         "FX_REVERB_ROOM_SIZE": 0.6,
         "FX_REVERB_WET": 0.4,
-        "FX_CHORUS_ENABLED": True,
+        "FX_CHORUS_ENABLED": False,
         "FX_CHORUS_RATE": 1.0,
         "FX_CHORUS_DEPTH": 0.3,
         "FX_CHORUS_MIX": 0.2,
@@ -162,7 +162,7 @@ PRESETS = {
     # Moving camera causes radical pitch and tempo shifts.
     "glitchy": {
         "BLEND_ALPHA": 0.85,
-        "AUDIO_SECONDS": 0.75,
+        "AUDIO_SECONDS": 0.5,
         "LAYER_GLITCH_LEVEL": 0.65,
         "LAYER_TONAL_LEVEL": 0.20,
         "LAYER_RHYTHM_LEVEL": 0.25,
@@ -196,7 +196,7 @@ PRESETS = {
     # Works best with high-contrast scenes with repeated patterns.
     "percussive": {
         "BLEND_ALPHA": 0.50,
-        "AUDIO_SECONDS": 1.0,
+        "AUDIO_SECONDS": 0.6,
         "LAYER_GLITCH_LEVEL": 0.08,
         "LAYER_TONAL_LEVEL": 0.28,
         "LAYER_RHYTHM_LEVEL": 0.78,
