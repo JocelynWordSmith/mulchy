@@ -15,14 +15,10 @@ if ! command -v uv &> /dev/null; then
 fi
 
 # ── Pi-specific system packages ───────────────────────────────────────────────
-# picamera2 and sounddevice require system libraries that cannot be cleanly
-# resolved via pip, so we use apt for picamera2 and install sounddevice after.
+# picamera2 requires system libraries that cannot be cleanly resolved via pip.
 echo "Installing Pi system packages..."
 sudo apt-get update -qq
-sudo apt-get install -y python3-picamera2 libportaudio2 portaudio19-dev
-
-# sounddevice needs libportaudio2 (installed above) before pip can use it
-pip install --break-system-packages sounddevice
+sudo apt-get install -y python3-picamera2
 
 # ── Python dependencies (via uv) ──────────────────────────────────────────────
 echo "Installing Python dependencies via uv..."
@@ -30,10 +26,12 @@ cd "$INSTALL_DIR"
 uv sync
 
 # ── Audio output configuration ────────────────────────────────────────────────
-echo "Configuring audio output to 3.5mm jack..."
-sudo amixer cset numid=3 1   # 0=auto, 1=headphones, 2=hdmi
-if ! grep -q "dtparam=audio=on" /boot/config.txt 2>/dev/null; then
-    echo "dtparam=audio=on" | sudo tee -a /boot/config.txt
+# Bookworm moved config.txt to /boot/firmware; Bullseye and earlier use /boot.
+echo "Configuring audio output..."
+BOOT_CONFIG=/boot/firmware/config.txt
+[ -f "$BOOT_CONFIG" ] || BOOT_CONFIG=/boot/config.txt
+if [ -f "$BOOT_CONFIG" ] && ! grep -q "dtparam=audio=on" "$BOOT_CONFIG"; then
+    echo "dtparam=audio=on" | sudo tee -a "$BOOT_CONFIG"
 fi
 
 # ── Env file ──────────────────────────────────────────────────────────────────
@@ -64,7 +62,7 @@ User=pi
 WorkingDirectory=$INSTALL_DIR
 ExecStartPre=/bin/sleep 3
 ExecStartPre=/usr/bin/amixer -c 1 sset PCM 100%
-ExecStart=$UV_BIN run --directory $INSTALL_DIR mulchy --preset ambient
+ExecStart=$UV_BIN run --directory $INSTALL_DIR mulchy
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -84,5 +82,5 @@ echo ""
 echo "Start now:    sudo systemctl start mulchy"
 echo "Stop:         sudo systemctl stop mulchy"
 echo "Logs:         journalctl -u mulchy -f"
-echo "Run manually: uv run mulchy --preset ambient"
-echo "Test pattern: uv run mulchy --source test --no-audio"
+echo "Run manually: uv run mulchy"
+echo "Test pattern: uv run mulchy --source test"
