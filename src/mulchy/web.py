@@ -44,6 +44,16 @@ _lock: threading.Lock = threading.Lock()
 _frame_jpeg: bytes | None = None
 _features: dict = {}
 
+# Callbacks injected by main.py so the UI can flip the audio filter mode
+# at runtime without web.py importing analyzer directly.
+_filter_callbacks: dict = {"get": None, "set": None}
+
+
+def register_controls(*, get_filter=None, set_filter=None) -> None:
+    """Wire up runtime-control hooks. Called once from main.py at startup."""
+    if get_filter is not None: _filter_callbacks["get"] = get_filter
+    if set_filter is not None: _filter_callbacks["set"] = set_filter
+
 
 def _encode_jpeg(frame: np.ndarray, quality: int = 70) -> bytes:
     """Encode an H×W×3 uint8 RGB array to JPEG bytes."""
@@ -102,11 +112,22 @@ def stream_video():
 
 @app.route("/api/status")
 def status_route():
-    """Small JSON peek at the latest features. Helpful for debugging without
-    a screen — curl http://mulchy.local:5000/api/status."""
+    """Small JSON peek at the latest features + current control state.
+    Helpful for debugging without a screen — curl http://mulchy.local:5000/api/status."""
     with _lock:
         f = dict(_features)
+    if _filter_callbacks["get"]:
+        f["_filter"] = _filter_callbacks["get"]()
     return jsonify(f)
+
+
+@app.route("/api/filter", methods=["POST"])
+def filter_route():
+    mode = (request.get_json(force=True) or {}).get("mode")
+    if mode not in ("squiggle", "spiral") or _filter_callbacks["set"] is None:
+        return jsonify({"error": "invalid mode"}), 400
+    _filter_callbacks["set"](mode)
+    return jsonify({"ok": True, "mode": mode})
 
 
 # ── Index page (live feed + wifi link + shutdown) ────────────────────────
@@ -129,12 +150,20 @@ _INDEX_HTML = r"""<!doctype html>
     .stream img, .stream canvas { width: 100%; height: 100%; object-fit: contain;
       display: block; }
     .stream canvas { position: absolute; inset: 0; display: none; }
-    nav { display: flex; gap: 12px; }
-    nav a, nav button { font: inherit; color: #eee; text-decoration: none;
+    .controls { display: flex; flex-direction: column; gap: 6px;
+      align-items: center; width: 100%; max-width: 720px; }
+    .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+      justify-content: center; }
+    .row .lbl { font-size: 11px; color: #888; text-transform: uppercase;
+      letter-spacing: 0.05em; margin-right: 4px; }
+    nav { display: flex; gap: 12px; margin-top: 4px; }
+    nav a, nav button, .row button { font: inherit; color: #eee; text-decoration: none;
       background: #1c1c1c; border: 1px solid #2a2a2a; border-radius: 3px;
-      padding: 8px 14px; cursor: pointer; }
-    nav a:hover, nav button:hover { border-color: #c9a86a; color: #c9a86a; }
-    nav button.active { border-color: #c9a86a; color: #c9a86a; }
+      padding: 6px 12px; cursor: pointer; font-size: 13px; }
+    nav a:hover, nav button:hover, .row button:hover {
+      border-color: #c9a86a; color: #c9a86a; }
+    nav button.active, .row button.active {
+      border-color: #c9a86a; color: #c9a86a; }
     .danger { border-color: #5a2a2a !important; color: #c98080 !important; }
     .danger:hover { border-color: #c95050 !important; color: #c95050 !important; }
     #status { font-size: 11px; color: #888; font-variant-numeric: tabular-nums; }
@@ -147,45 +176,74 @@ _INDEX_HTML = r"""<!doctype html>
       <img id="live" src="/stream/video" alt="live camera feed">
       <canvas id="squiggle"></canvas>
     </div>
+    <div class="controls">
+      <div class="row">
+        <span class="lbl">view</span>
+        <button class="viewBtn active" data-view="camera">camera</button>
+        <button class="viewBtn" data-view="squiggle">squiggle</button>
+        <button class="viewBtn" data-view="spiral">spiral</button>
+      </div>
+    </div>
     <nav>
-      <button id="squiggleToggle" type="button">squiggle</button>
       <a href="/wifi">wifi</a>
       <button id="shutdown" class="danger" type="button">shutdown</button>
     </nav>
     <div id="status"></div>
   </main>
   <script>
-    // ── Squiggle overlay ────────────────────────────────────────────────
-    // Front-end-only port of analyzer._squiggle_longest_polyline. Draws
-    // every row's polyline so the operator can see the line-art view the
-    // squiggle drawer "sees"; the Python side picks one row from these
-    // and turns it into voices, but we render all of them for the visual.
-    // Constants mirror analyzer.py — keep them in sync if those change.
+    // ── Filter visualizations ──────────────────────────────────────────
+    // Two filter strategies mirror the Python analyzer: squiggle (overlay
+    // on the live feed, highlights the one row that drives all six
+    // voices) and spiral (replaces the feed entirely, draws the v2-style
+    // colored Archimedean spiral with the longest contiguous bin-run —
+    // the polyline that actually becomes the audio — rendered bright;
+    // every other arc is dimmed). The camera <img> keeps streaming behind
+    // the canvas so getImageData has fresh pixels even when spiral mode
+    // is showing.
+
+    // Squiggle constants. SQ_ROWS matches analyzer.py so the highlight is
+    // the same row the audio uses; VIS_FREQ/AMP are larger than the
+    // analyzer's so darkness variation reads at a glance.
     const SQ_ROWS = 100;
-    const SQ_FREQ = 60.0;
-    const SQ_AMP = 0.6;
-    const SQ_SAMPLES = 600;
+    const SQ_VIS_FREQ = 14;
+    const SQ_VIS_AMP = 2.4;
+    const SQ_SAMPLES = 480;
+
+    // Spiral constants — must mirror SPIRAL_* in analyzer.py exactly so
+    // the bright polyline drawn here is the same arc the audio uses.
+    const SP_TURNS = 60;
+    const SP_SAMPLES_PER_TURN = 200;
+    const SP_LEVELS = 8;
+    const SP_MARGIN = 0.02;
+    const SP_INVERT = true;
+    const SP_STROKE_MIN = 0.2;
+    const SP_STROKE_MAX = 1.5;
 
     const liveImg = document.getElementById('live');
     const sqCanvas = document.getElementById('squiggle');
     const sqCtx = sqCanvas.getContext('2d', { willReadFrequently: true });
-    const sqBtn = document.getElementById('squiggleToggle');
-    let sqOn = false;
-    let sqTimer = null;
+
+    let viewMode = 'camera';   // 'camera' | 'squiggle' | 'spiral'
+    let renderTimer = null;
 
     function drawSquiggles(ctx, frameData, w, h) {
       const rowSpacing = h / SQ_ROWS;
       const halfBand = rowSpacing / 2;
       const data = frameData.data;
-      ctx.strokeStyle = 'rgba(201, 168, 106, 0.9)';
-      ctx.lineWidth = 1;
+
+      // Per-row darkness sum (for picking the global longest row) AND
+      // per-row y-trajectory (for drawing). Storing trajectories lets us
+      // draw all rows lightly then redraw the chosen one bright without
+      // recomputing.
+      const ampSums = new Float32Array(SQ_ROWS);
+      const rowYs = new Array(SQ_ROWS);
       for (let i = 0; i < SQ_ROWS; i++) {
         const yCenter = (i + 0.5) * rowSpacing;
         const top = Math.max(0, Math.floor(yCenter - halfBand));
         const bot = Math.min(h, Math.floor(yCenter + halfBand + 1));
         const bandRows = Math.max(1, bot - top);
-        const phaseShift = (i % 2) ? Math.PI : 0;
-        ctx.beginPath();
+        const ys = new Float32Array(SQ_SAMPLES);
+        let darkRowSum = 0;
         for (let s = 0; s < SQ_SAMPLES; s++) {
           const x = (s / (SQ_SAMPLES - 1)) * w;
           const xi = Math.min(w - 1, Math.floor(x));
@@ -195,41 +253,182 @@ _INDEX_HTML = r"""<!doctype html>
             const luma = (0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2]) / 255;
             darkSum += 1 - luma;
           }
-          const amp = (darkSum / bandRows) * SQ_AMP * halfBand;
-          const ph = 2 * Math.PI * SQ_FREQ * x / w + phaseShift;
-          const y = yCenter + Math.sin(ph) * amp;
-          if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          const dark = darkSum / bandRows;
+          darkRowSum += dark;
+          const amp = dark * SQ_VIS_AMP * halfBand;
+          const ph = 2 * Math.PI * SQ_VIS_FREQ * x / w;
+          ys[s] = yCenter + Math.sin(ph) * amp;
+        }
+        ampSums[i] = darkRowSum;
+        rowYs[i] = ys;
+      }
+
+      // Global winner — the one row the analyzer picks and splits into
+      // six voice chunks.
+      let bestAmp = -1, bestRow = -1;
+      for (let i = 0; i < SQ_ROWS; i++) {
+        if (ampSums[i] > bestAmp) { bestAmp = ampSums[i]; bestRow = i; }
+      }
+
+      // All non-chosen rows — soft gold so the chosen row stands out.
+      ctx.strokeStyle = 'rgba(201, 168, 106, 0.35)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < SQ_ROWS; i++) {
+        if (i === bestRow) continue;
+        const ys = rowYs[i];
+        ctx.beginPath();
+        for (let s = 0; s < SQ_SAMPLES; s++) {
+          const x = (s / (SQ_SAMPLES - 1)) * w;
+          if (s === 0) ctx.moveTo(x, ys[s]); else ctx.lineTo(x, ys[s]);
+        }
+        ctx.stroke();
+      }
+
+      // Chosen row — the one row driving all six voices — bright + thicker.
+      if (bestRow >= 0) {
+        ctx.strokeStyle = 'rgba(255, 220, 130, 1.0)';
+        ctx.lineWidth = 1.75;
+        const ys = rowYs[bestRow];
+        ctx.beginPath();
+        for (let s = 0; s < SQ_SAMPLES; s++) {
+          const x = (s / (SQ_SAMPLES - 1)) * w;
+          if (s === 0) ctx.moveTo(x, ys[s]); else ctx.lineTo(x, ys[s]);
         }
         ctx.stroke();
       }
     }
 
-    function renderSquiggle() {
-      if (!sqOn) return;
+    function drawSpiral(ctx, frameData, w, h) {
+      // Black background — spiral replaces the live feed entirely.
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, w, h);
+
+      const cx = w / 2, cy = h / 2;
+      const maxR = Math.max(1, Math.min(w, h) / 2 * (1 - SP_MARGIN));
+      const n = SP_TURNS * SP_SAMPLES_PER_TURN;
+      const data = frameData.data;
+
+      // Walk the spiral once, collecting (xi, yi, bin) per sample. Then
+      // segment into runs of the same bin, exactly like analyzer.py's
+      // _spiral_polyline_for_audio so the "longest run" identified here
+      // is the same arc the Python side feeds to the audio engine.
+      const xs = new Float32Array(n);
+      const ys = new Float32Array(n);
+      const bins = new Int8Array(n);
+      const levelsM1 = SP_LEVELS - 1;
+      for (let i = 0; i < n; i++) {
+        const t = i / (n - 1);
+        const theta = SP_TURNS * 2 * Math.PI * t;
+        const r = maxR * t;
+        const x = cx + r * Math.cos(theta);
+        const y = cy + r * Math.sin(theta);
+        xs[i] = x; ys[i] = y;
+        const xi = Math.min(w - 1, Math.max(0, x | 0));
+        const yi = Math.min(h - 1, Math.max(0, y | 0));
+        const idx = (yi * w + xi) * 4;
+        const luma = (0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2]) / 255;
+        const dark = SP_INVERT ? luma : 1 - luma;
+        let b = (dark * SP_LEVELS) | 0;
+        if (b < 0) b = 0; else if (b > levelsM1) b = levelsM1;
+        bins[i] = b;
+      }
+
+      // Run-length: each run is [start, end) of one bin. Track the longest.
+      const starts = [0];
+      const ends = [];
+      for (let i = 1; i < n; i++) {
+        if (bins[i] !== bins[i - 1]) {
+          ends.push(i);
+          starts.push(i);
+        }
+      }
+      ends.push(n);
+      let longestIdx = 0, longestLen = ends[0] - starts[0];
+      for (let k = 1; k < starts.length; k++) {
+        const len = ends[k] - starts[k];
+        if (len > longestLen) { longestLen = len; longestIdx = k; }
+      }
+      const longestStart = starts[longestIdx];
+      const longestEnd = ends[longestIdx];
+
+      // Draw each run as a polyline. Stroke width derived from bin (matches
+      // v2). Color sampled from the middle of the run. Non-longest runs
+      // render dimmed; the longest renders at full brightness.
+      const widthSpan = SP_STROKE_MAX - SP_STROKE_MIN;
+      for (let k = 0; k < starts.length; k++) {
+        const s = starts[k], e = ends[k];
+        if (e - s < 2) continue;
+        const bin = bins[s];
+        const stroke = SP_STROKE_MIN + (bin / levelsM1) * widthSpan;
+        const mid = (s + e) >> 1;
+        const xi = Math.min(w - 1, Math.max(0, xs[mid] | 0));
+        const yi = Math.min(h - 1, Math.max(0, ys[mid] | 0));
+        const di = (yi * w + xi) * 4;
+        const r = data[di], g = data[di + 1], bl = data[di + 2];
+        const isLongest = (k === longestIdx);
+        const alpha = isLongest ? 1.0 : 0.35;
+        ctx.strokeStyle = `rgba(${r},${g},${bl},${alpha})`;
+        ctx.lineWidth = isLongest ? Math.max(1.2, stroke * 1.4) : stroke;
+        ctx.beginPath();
+        ctx.moveTo(xs[s], ys[s]);
+        // Overlap one point with the next run so the spiral reads continuous
+        // (matches v2's _emit using stop + 1).
+        const drawEnd = Math.min(n, e + 1);
+        for (let i = s + 1; i < drawEnd; i++) ctx.lineTo(xs[i], ys[i]);
+        ctx.stroke();
+      }
+      // Subtle band labelling the longest arc — pulled out of the loop so
+      // it always lands on top of any overlapping faded segments.
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(xs[longestStart], ys[longestStart]);
+      for (let i = longestStart + 1; i < longestEnd; i++) ctx.lineTo(xs[i], ys[i]);
+      ctx.stroke();
+    }
+
+    function renderFrame() {
       const w = liveImg.naturalWidth, h = liveImg.naturalHeight;
       if (w && h) {
         if (sqCanvas.width !== w) sqCanvas.width = w;
         if (sqCanvas.height !== h) sqCanvas.height = h;
-        // Read pixels from the full-strength frame, THEN dim the canvas and
-        // draw squiggles over the dimmed backdrop.
+        // Always pull a fresh pixel snapshot from the live <img>; both
+        // visualizations read from it.
         sqCtx.drawImage(liveImg, 0, 0, w, h);
         const data = sqCtx.getImageData(0, 0, w, h);
-        sqCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-        sqCtx.fillRect(0, 0, w, h);
-        drawSquiggles(sqCtx, data, w, h);
+        if (viewMode === 'squiggle') {
+          sqCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+          sqCtx.fillRect(0, 0, w, h);
+          drawSquiggles(sqCtx, data, w, h);
+        } else if (viewMode === 'spiral') {
+          drawSpiral(sqCtx, data, w, h);
+        }
       }
-      sqTimer = setTimeout(renderSquiggle, 200);
+      renderTimer = setTimeout(renderFrame, 200);
     }
 
-    sqBtn.addEventListener('click', () => {
-      sqOn = !sqOn;
-      sqBtn.classList.toggle('active', sqOn);
-      sqCanvas.style.display = sqOn ? 'block' : 'none';
-      if (sqOn) {
-        renderSquiggle();
-      } else if (sqTimer) {
-        clearTimeout(sqTimer); sqTimer = null;
+    function setView(mode) {
+      viewMode = mode;
+      sqCanvas.style.display = (mode === 'camera') ? 'none' : 'block';
+      document.querySelectorAll('.viewBtn').forEach(b => {
+        b.classList.toggle('active', b.dataset.view === mode);
+      });
+      // Audio filter follows the view: camera + squiggle both use
+      // squiggle on the audio side, spiral uses spiral.
+      const audioMode = (mode === 'spiral') ? 'spiral' : 'squiggle';
+      fetch('/api/filter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: audioMode }),
+      }).catch(() => {});
+      if (mode !== 'camera' && renderTimer == null) renderFrame();
+      if (mode === 'camera' && renderTimer != null) {
+        clearTimeout(renderTimer); renderTimer = null;
       }
+    }
+
+    document.querySelectorAll('.viewBtn').forEach(b => {
+      b.addEventListener('click', () => setView(b.dataset.view));
     });
 
     document.getElementById('shutdown').addEventListener('click', async () => {

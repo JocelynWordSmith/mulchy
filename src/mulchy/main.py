@@ -20,7 +20,7 @@ import time
 
 from mulchy import config as cfg
 from mulchy import web
-from mulchy.analyzer import analyze
+from mulchy.analyzer import analyze, get_filter_mode, set_filter_mode
 from mulchy.sources import VideoSource, make_source
 from mulchy.synthesizer import Synthesizer
 
@@ -49,6 +49,12 @@ class Mulchy:
             audio_enabled=audio_enabled,
         )
         web.run()
+
+        # Wire runtime control so the dashboard can flip the audio filter.
+        web.register_controls(
+            get_filter=get_filter_mode,
+            set_filter=set_filter_mode,
+        )
 
         signal.signal(signal.SIGINT,  self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)

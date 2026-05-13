@@ -1,21 +1,21 @@
 """Mulchy — image analyzer.
 
-Single-pass image → (features, voices) extraction. There is no strategy
-selection: the device only runs the squiggle drawer and the polyline-arc
-sampler. This is by design — the field-recorder use case wants the device
-to do exactly one thing, deterministically, with no controls to fiddle.
+Single-pass image → (features, voices) extraction. Two filter strategies
+are available, switchable at runtime via set_filter_mode():
+
+- "squiggle" (default): each image row becomes a sine carrier modulated
+  by darkness. The longest darkness-modulated row is split into 6
+  equal-arc-length chunks, each chunk's y trajectory → one voice.
+- "spiral": an Archimedean spiral walks the image from centre outward;
+  contiguous runs of the same stroke-bin become polylines. The longest
+  polyline is split into 6 equal-arc-length chunks, same as squiggle.
 
 Output:
 - ``voices``  — (6, CYCLE_SAMPLES) float32 array in [-1, 1]. Six single-cycle
                 waveforms the synthesizer plays as a layered JI soundscape.
 - ``features`` — small dict of 0–1 floats the synthesizer uses to modulate
                 playback (hue → pitch, brightness → energy + filter, edges
-                + motion → pluck rate, saturation → reverb wet).
-
-The voices come from splitting the squiggle drawer's longest polyline into
-six equal-arc-length chunks; each chunk's vertical (y) trajectory becomes
-one voice. The longest polyline is whichever squiggle row had the most
-darkness-modulated content."""
+                + motion → pluck rate, saturation → reverb wet)."""
 
 from __future__ import annotations
 
@@ -36,10 +36,40 @@ SQUIGGLE_AMPLITUDE = 0.6
 SQUIGGLE_SAMPLES_PER_CYCLE = 10
 SQUIGGLE_ALTERNATE_PHASE = True
 
+# Spiral raster params — same locked-in defaults as the mulchyv2 strategy
+# (turns=60, samples_per_turn=200, levels=8, margin=0.02, invert=True). The
+# stroke_min/_max values aren't used by the audio path here but are listed
+# so the front-end visualization can mirror v2's look without divergence.
+SPIRAL_TURNS            = 60
+SPIRAL_SAMPLES_PER_TURN = 200
+SPIRAL_STROKE_MIN       = 0.2
+SPIRAL_STROKE_MAX       = 1.5
+SPIRAL_LEVELS           = 8
+SPIRAL_MARGIN           = 0.02
+SPIRAL_INVERT           = True  # True = light pixels → thick stroke
+
+# Runtime-selectable filter mode. The web UI swaps between these via
+# set_filter_mode(); audio + the front-end visualization both follow.
+_FILTER_MODES = ("squiggle", "spiral")
+_filter_mode = "squiggle"
+
 # Motion is computed against the previous frame's RGB array. Module-level
 # state since the analyzer is called serially from the main loop.
 _lock = threading.Lock()
 _last_array: np.ndarray | None = None
+
+
+def set_filter_mode(mode: str) -> None:
+    """Switch between 'squiggle' and 'spiral'. Bad values are ignored
+    silently — the UI sends only validated strings, and a transient bad
+    request shouldn't stop the audio loop."""
+    global _filter_mode
+    if mode in _FILTER_MODES:
+        _filter_mode = mode
+
+
+def get_filter_mode() -> str:
+    return _filter_mode
 
 
 def reset_motion_state() -> None:
@@ -91,6 +121,52 @@ def _squiggle_longest_polyline(image: np.ndarray) -> np.ndarray:
         best_xs = xs
         best_ys = np.full_like(xs, h / 2.0)
     return np.stack([best_xs, best_ys], axis=-1).astype(np.float32)
+
+
+# ── Spiral raster (v2-faithful) ──────────────────────────────────────────
+
+def _spiral_polyline_for_audio(rgb: np.ndarray) -> np.ndarray:
+    """Walk a 60-turn Archimedean spiral from the centre outward, bin
+    darkness at each sample into SPIRAL_LEVELS strokes, return the
+    longest contiguous bin-run as an (N, 2) polyline. Mirrors what
+    mulchyv2/strategies/spiral.py emits and what its polyline-arc sampler
+    feeds to the audio engine."""
+    h, w = rgb.shape[:2]
+    cx, cy = w / 2.0, h / 2.0
+    max_r = max(1.0, min(w, h) / 2.0 * (1.0 - SPIRAL_MARGIN))
+
+    gray = (
+        0.299 * rgb[..., 0].astype(np.float32)
+        + 0.587 * rgb[..., 1].astype(np.float32)
+        + 0.114 * rgb[..., 2].astype(np.float32)
+    ) / 255.0
+    darkness = gray if SPIRAL_INVERT else 1.0 - gray
+
+    n = SPIRAL_TURNS * SPIRAL_SAMPLES_PER_TURN
+    thetas = np.linspace(0.0, SPIRAL_TURNS * 2.0 * math.pi, n, dtype=np.float32)
+    rs = np.linspace(0.0, max_r, n, dtype=np.float32)
+    xs = cx + rs * np.cos(thetas)
+    ys = cy + rs * np.sin(thetas)
+
+    xi = np.clip(xs.astype(np.int32), 0, w - 1)
+    yi = np.clip(ys.astype(np.int32), 0, h - 1)
+    bins = np.clip((darkness[yi, xi] * SPIRAL_LEVELS).astype(np.int32), 0, SPIRAL_LEVELS - 1)
+
+    # Find run boundaries with a single vectorized diff; then pick the
+    # longest run. np.flatnonzero on bin-change positions is much faster
+    # than a Python loop over 12k points.
+    change_idx = np.flatnonzero(np.diff(bins)) + 1
+    starts = np.concatenate([[0], change_idx])
+    ends = np.concatenate([change_idx, [n]])
+    lengths = ends - starts
+    best = int(np.argmax(lengths))
+    s, e = int(starts[best]), int(ends[best])
+    if e - s < VOICES + 1:
+        # Degenerate (e.g. uniform image with one giant bin spanning everything
+        # also lands here on rare boundary cases). Fall back to the whole
+        # spiral as a single polyline so chunking still has enough points.
+        s, e = 0, n
+    return np.stack([xs[s:e], ys[s:e]], axis=-1).astype(np.float32)
 
 
 # ── Polyline arc-length sampler ──────────────────────────────────────────
@@ -220,9 +296,15 @@ def analyze(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
         )
     rgb_f = frame.astype(np.float32) / 255.0
     features = _compute_features(rgb_f)
-    # Run squiggle on a luminance image for speed.
-    luma = (0.299 * frame[..., 0] + 0.587 * frame[..., 1] + 0.114 * frame[..., 2]).astype(np.uint8)
-    polyline = _squiggle_longest_polyline(luma)
+    if _filter_mode == "spiral":
+        polyline = _spiral_polyline_for_audio(frame)
+    else:
+        # Squiggle on luminance for speed — colour adds nothing to the
+        # darkness-modulated row picker.
+        luma = (
+            0.299 * frame[..., 0] + 0.587 * frame[..., 1] + 0.114 * frame[..., 2]
+        ).astype(np.uint8)
+        polyline = _squiggle_longest_polyline(luma)
     voices = _polyline_to_voices(polyline)
     return voices, features
 
@@ -233,4 +315,6 @@ __all__ = [
     "DEFAULT_FEATURES",
     "analyze",
     "reset_motion_state",
+    "set_filter_mode",
+    "get_filter_mode",
 ]
