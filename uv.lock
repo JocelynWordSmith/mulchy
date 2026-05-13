@@ -501,12 +501,10 @@ dependencies = [
     { name = "pillow" },
     { name = "python-dotenv" },
     { name = "scipy" },
+    { name = "sounddevice" },
 ]
 
 [package.optional-dependencies]
-audio = [
-    { name = "sounddevice" },
-]
 dev = [
     { name = "playwright" },
     { name = "pytest" },
@@ -531,9 +529,9 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
     { name = "scipy", specifier = ">=1.11" },
-    { name = "sounddevice", marker = "extra == 'audio'" },
+    { name = "sounddevice" },
 ]
-provides-extras = ["audio", "webcam", "dev"]
+provides-extras = ["webcam", "dev"]
 
 [[package]]
 name = "numpy"

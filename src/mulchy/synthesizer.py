@@ -81,7 +81,37 @@ ENERGY_MAX = 1.15
 
 REVERB_DURATION_S = 2.0
 REVERB_DECAY      = 3.0
-REVERB_WET        = 0.35
+# Saturation modulates reverb wet between MIN (muted/grey frames feel dry and
+# close) and MAX (vivid frames bloom into a larger space). The old fixed
+# REVERB_WET=0.35 sits roughly in the middle of this range.
+REVERB_WET_MIN    = 0.20
+REVERB_WET_MAX    = 0.65
+
+# ── Conditional layers ──────────────────────────────────────────────────
+# Two extra sources that only fade in when the image crosses a threshold,
+# so different scenes sound categorically different rather than just louder
+# or quieter. Both render alongside the six per-frame voices and inherit
+# the same per-frame lifetime envelope (so successive frames overlap into
+# a continuous layer).
+#
+# Sub-bass: a single low sine that appears in dark frames. Fixed pitch (does
+# NOT follow hue) so it stays as a stable foundation; otherwise overlapping
+# frames at slightly different pitches would beat audibly at sub frequencies.
+SUBBASS_RATIO        = 0.5     # half base_freq → ~40 Hz at 80 Hz base
+SUBBASS_GAIN         = 0.12
+SUBBASS_DARK_THRESH  = 0.25    # gate is full ON when brightness ≤ this
+SUBBASS_FADE         = 0.15    # …and full OFF at thresh + fade
+# Sub-bass routes around the reverb (dry only) — wet sub turns to mud.
+
+# Shimmer: a handful of high partials, faintly detuned away from integer
+# ratios for a glassier, less "stacked-third" timbre. Follows hue pitch
+# with the other voices. Routed through the reverb tail.
+SHIMMER_RATIOS         = (5.0, 7.07, 9.13)
+SHIMMER_GAIN           = 0.08
+SHIMMER_SAT_THRESH     = 0.55   # gate is full OFF when saturation ≤ this
+SHIMMER_FADE           = 0.15   # …and full ON at thresh + fade
+SHIMMER_TREMOLO_HZ     = 0.7
+SHIMMER_TREMOLO_DEPTH  = 0.5
 
 RING_BUFFER_SECONDS = 30   # generous; never overflows at 5 fps
 
@@ -209,11 +239,16 @@ class Synthesizer:
         except Exception as e:
             log.warning("sounddevice unavailable (%s) — running silently", e)
             return
+        # blocksize=2048 (~93 ms at 22.05 kHz) gives PortAudio enough grace
+        # that a single slow main-thread frame (fftconvolve + sosfilt) or a
+        # ~ms-scale lock hold doesn't underrun the output. blocksize=0 lets
+        # PortAudio pick, which on a busy Pi 3B tends to land at 512–1024
+        # frames — marginal under load and the source of audible crackle.
         self._stream = sd.OutputStream(
             samplerate=self.sr,
             channels=1,
             dtype="float32",
-            blocksize=0,  # let portaudio pick
+            blocksize=2048,
             callback=self._callback,
         )
         self._stream.start()
@@ -289,13 +324,26 @@ class Synthesizer:
         for v_idx in range(VOICES):
             master += self._render_voice(voices[v_idx], v_idx, t_abs, lifetime)
 
+        # Shimmer joins master before reverb so it picks up the wet tail —
+        # that's what makes high partials feel "shimmery" rather than just
+        # bright. Sub-bass stays out of master and is mixed dry only.
+        shim = self._render_shimmer(t_abs, lifetime, float(features.get("saturation", 0.5)))
+        if shim is not None:
+            master += shim
+        sub = self._render_subbass(t_abs, lifetime, float(features.get("brightness", 0.5)))
+
         # Convolution reverb: produces a tail longer than `n` samples. Mix the
         # full tail into the ring buffer too so reverb continues past the
         # source's lifetime.
         wet = fftconvolve(master, self._reverb_ir, mode="full").astype(np.float32)
+        wet_amount = REVERB_WET_MIN + (REVERB_WET_MAX - REVERB_WET_MIN) * float(
+            features.get("saturation", 0.5)
+        )
         mix = np.zeros(len(wet), dtype=np.float32)
-        mix[:n] = master * (1.0 - REVERB_WET)
-        mix += wet * REVERB_WET
+        mix[:n] = master * (1.0 - wet_amount)
+        if sub is not None:
+            mix[:n] += sub
+        mix += wet * wet_amount
         mix *= self.energy_gain * MASTER_GAIN
 
         # Tanh soft-saturation as a final safety. Cheap and prevents the
@@ -364,6 +412,42 @@ class Synthesizer:
         out = filtered * role_env * VOICE_GAINS[v_idx]
         return out.astype(np.float32)
 
+    def _render_subbass(
+        self, t_abs: np.ndarray, lifetime: np.ndarray, brightness: float,
+    ) -> np.ndarray | None:
+        """Low sine that fades in on dark frames. Returns None when the gate
+        is fully closed so the caller can skip the dry-mix add."""
+        gate = (SUBBASS_DARK_THRESH + SUBBASS_FADE - brightness) / SUBBASS_FADE
+        gate = float(np.clip(gate, 0.0, 1.0))
+        if gate <= 0.0:
+            return None
+        # Fixed pitch (NOT scaled by hue_pitch_mult): overlapping frames
+        # from a wobbling pitch would beat at sub frequencies and sound bad.
+        f = self.base_freq * SUBBASS_RATIO
+        sig = np.sin(2.0 * math.pi * f * t_abs).astype(np.float32)
+        return (sig * lifetime * (gate * SUBBASS_GAIN)).astype(np.float32)
+
+    def _render_shimmer(
+        self, t_abs: np.ndarray, lifetime: np.ndarray, saturation: float,
+    ) -> np.ndarray | None:
+        """High detuned partials that fade in on saturated frames. Follows
+        hue pitch with the other voices and routes through the reverb."""
+        gate = (saturation - SHIMMER_SAT_THRESH) / SHIMMER_FADE
+        gate = float(np.clip(gate, 0.0, 1.0))
+        if gate <= 0.0:
+            return None
+        sig = np.zeros(len(t_abs), dtype=np.float32)
+        for ratio in SHIMMER_RATIOS:
+            f = self.base_freq * self.hue_pitch_mult * ratio
+            sig += np.sin(2.0 * math.pi * f * t_abs).astype(np.float32)
+        sig /= float(len(SHIMMER_RATIOS))
+        # Slow tremolo: depth=0.5 means amplitude swings between 0.5 and 1.0.
+        tremolo = (
+            1.0 - 0.5 * SHIMMER_TREMOLO_DEPTH
+            * (1.0 - np.cos(2.0 * math.pi * SHIMMER_TREMOLO_HZ * t_abs))
+        ).astype(np.float32)
+        return (sig * tremolo * lifetime * (gate * SHIMMER_GAIN)).astype(np.float32)
+
     def _pluck_envelope_in_window(self, p_idx: int, t_abs: np.ndarray) -> np.ndarray:
         env = np.zeros_like(t_abs, dtype=np.float32)
         win_start = float(t_abs[0])
@@ -413,15 +497,21 @@ class Synthesizer:
         file. Reads from the ring buffer's "future" region (past read_pos)
         plus a snapshot of what we just mixed."""
         try:
+            # Hold the lock only long enough for a contiguous memcpy of the
+            # ring (~2.6 MB at 22.05 kHz × 30 s × float32 ≈ sub-millisecond
+            # on a Pi 3B). The earlier version did a fancy-indexed gather
+            # with a 5 MB int64 arange under the lock; that block ran tens
+            # of ms and starved the audio callback every DEBUG_WAV_INTERVAL_S
+            # seconds — which is exactly what the ~10 s skip sounded like.
             with self._lock:
-                # Build a contiguous snapshot: starting just behind the
-                # current read position, going forward through the buffer.
-                # This gives the most recent ~RING_BUFFER_SECONDS of audio
-                # in playback order. Note: positions past read_pos haven't
-                # played yet; they're the future-mixed content.
-                base = (self._read_pos - self._buffer_size // 4) % self._buffer_size
-                idx = (base + np.arange(self._buffer_size)) % self._buffer_size
-                snap = self._ring[idx].copy()
+                read_pos_now = self._read_pos
+                ring_copy = self._ring.copy()
+            # Reorder into playback order outside the lock. Starting a
+            # quarter-buffer behind read_pos gives the most recent audio in
+            # the order it played; positions past read_pos haven't played
+            # yet (future-mixed content).
+            base = (read_pos_now - self._buffer_size // 4) % self._buffer_size
+            snap = np.concatenate([ring_copy[base:], ring_copy[:base]])
             # int16 WAV at sr.
             clipped = np.clip(snap, -1.0, 1.0)
             ints = (clipped * 32767).astype(np.int16)

@@ -124,14 +124,17 @@ _INDEX_HTML = r"""<!doctype html>
       gap: 12px; padding: 12px; box-sizing: border-box; min-height: 100vh; }
     h1 { margin: 0; font-weight: 500; font-size: 16px; letter-spacing: 0.04em;
       text-transform: uppercase; color: #c9a86a; }
-    .stream { width: 100%; max-width: 720px; background: #000;
+    .stream { position: relative; width: 100%; max-width: 720px; background: #000;
       border: 1px solid #2a2a2a; border-radius: 4px; aspect-ratio: 4 / 3; }
-    .stream img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .stream img, .stream canvas { width: 100%; height: 100%; object-fit: contain;
+      display: block; }
+    .stream canvas { position: absolute; inset: 0; display: none; }
     nav { display: flex; gap: 12px; }
     nav a, nav button { font: inherit; color: #eee; text-decoration: none;
       background: #1c1c1c; border: 1px solid #2a2a2a; border-radius: 3px;
       padding: 8px 14px; cursor: pointer; }
     nav a:hover, nav button:hover { border-color: #c9a86a; color: #c9a86a; }
+    nav button.active { border-color: #c9a86a; color: #c9a86a; }
     .danger { border-color: #5a2a2a !important; color: #c98080 !important; }
     .danger:hover { border-color: #c95050 !important; color: #c95050 !important; }
     #status { font-size: 11px; color: #888; font-variant-numeric: tabular-nums; }
@@ -140,14 +143,95 @@ _INDEX_HTML = r"""<!doctype html>
 <body>
   <main>
     <h1>mulchy</h1>
-    <div class="stream"><img src="/stream/video" alt="live camera feed"></div>
+    <div class="stream">
+      <img id="live" src="/stream/video" alt="live camera feed">
+      <canvas id="squiggle"></canvas>
+    </div>
     <nav>
+      <button id="squiggleToggle" type="button">squiggle</button>
       <a href="/wifi">wifi</a>
       <button id="shutdown" class="danger" type="button">shutdown</button>
     </nav>
     <div id="status"></div>
   </main>
   <script>
+    // ── Squiggle overlay ────────────────────────────────────────────────
+    // Front-end-only port of analyzer._squiggle_longest_polyline. Draws
+    // every row's polyline so the operator can see the line-art view the
+    // squiggle drawer "sees"; the Python side picks one row from these
+    // and turns it into voices, but we render all of them for the visual.
+    // Constants mirror analyzer.py — keep them in sync if those change.
+    const SQ_ROWS = 100;
+    const SQ_FREQ = 60.0;
+    const SQ_AMP = 0.6;
+    const SQ_SAMPLES = 600;
+
+    const liveImg = document.getElementById('live');
+    const sqCanvas = document.getElementById('squiggle');
+    const sqCtx = sqCanvas.getContext('2d', { willReadFrequently: true });
+    const sqBtn = document.getElementById('squiggleToggle');
+    let sqOn = false;
+    let sqTimer = null;
+
+    function drawSquiggles(ctx, frameData, w, h) {
+      const rowSpacing = h / SQ_ROWS;
+      const halfBand = rowSpacing / 2;
+      const data = frameData.data;
+      ctx.strokeStyle = 'rgba(201, 168, 106, 0.9)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < SQ_ROWS; i++) {
+        const yCenter = (i + 0.5) * rowSpacing;
+        const top = Math.max(0, Math.floor(yCenter - halfBand));
+        const bot = Math.min(h, Math.floor(yCenter + halfBand + 1));
+        const bandRows = Math.max(1, bot - top);
+        const phaseShift = (i % 2) ? Math.PI : 0;
+        ctx.beginPath();
+        for (let s = 0; s < SQ_SAMPLES; s++) {
+          const x = (s / (SQ_SAMPLES - 1)) * w;
+          const xi = Math.min(w - 1, Math.floor(x));
+          let darkSum = 0;
+          for (let y = top; y < bot; y++) {
+            const idx = (y * w + xi) * 4;
+            const luma = (0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2]) / 255;
+            darkSum += 1 - luma;
+          }
+          const amp = (darkSum / bandRows) * SQ_AMP * halfBand;
+          const ph = 2 * Math.PI * SQ_FREQ * x / w + phaseShift;
+          const y = yCenter + Math.sin(ph) * amp;
+          if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+    }
+
+    function renderSquiggle() {
+      if (!sqOn) return;
+      const w = liveImg.naturalWidth, h = liveImg.naturalHeight;
+      if (w && h) {
+        if (sqCanvas.width !== w) sqCanvas.width = w;
+        if (sqCanvas.height !== h) sqCanvas.height = h;
+        // Read pixels from the full-strength frame, THEN dim the canvas and
+        // draw squiggles over the dimmed backdrop.
+        sqCtx.drawImage(liveImg, 0, 0, w, h);
+        const data = sqCtx.getImageData(0, 0, w, h);
+        sqCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        sqCtx.fillRect(0, 0, w, h);
+        drawSquiggles(sqCtx, data, w, h);
+      }
+      sqTimer = setTimeout(renderSquiggle, 200);
+    }
+
+    sqBtn.addEventListener('click', () => {
+      sqOn = !sqOn;
+      sqBtn.classList.toggle('active', sqOn);
+      sqCanvas.style.display = sqOn ? 'block' : 'none';
+      if (sqOn) {
+        renderSquiggle();
+      } else if (sqTimer) {
+        clearTimeout(sqTimer); sqTimer = null;
+      }
+    });
+
     document.getElementById('shutdown').addEventListener('click', async () => {
       if (!confirm('Power off the Pi?')) return;
       try {
