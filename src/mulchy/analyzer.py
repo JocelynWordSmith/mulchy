@@ -1,340 +1,249 @@
-"""
-Mulchy - Image Analyzer
-Converts a numpy image array into a feature dict that the synthesizer understands.
-No audio here — pure image analysis.
-"""
+"""Mulchy — image analyzer.
 
-from typing import TypedDict
+Single-pass image → (features, voices) extraction. There is no strategy
+selection: the device only runs the squiggle drawer and the polyline-arc
+sampler. This is by design — the field-recorder use case wants the device
+to do exactly one thing, deterministically, with no controls to fiddle.
+
+Output:
+- ``voices``  — (6, CYCLE_SAMPLES) float32 array in [-1, 1]. Six single-cycle
+                waveforms the synthesizer plays as a layered JI soundscape.
+- ``features`` — small dict of 0–1 floats the synthesizer uses to modulate
+                playback (hue → pitch, brightness → energy + filter, edges
+                + motion → pluck rate, saturation → reverb wet).
+
+The voices come from splitting the squiggle drawer's longest polyline into
+six equal-arc-length chunks; each chunk's vertical (y) trajectory becomes
+one voice. The longest polyline is whichever squiggle row had the most
+darkness-modulated content."""
+
+from __future__ import annotations
+
+import math
+import threading
 
 import numpy as np
-from scipy import ndimage
+from PIL import Image
+from scipy.ndimage import gaussian_filter1d
 
-from mulchy import config as cfg
+# === Drawing / sampling constants (locked-in defaults from the sandbox) ===
+CYCLE_SAMPLES = 1024
+VOICES = 6
 
+# Squiggle drawer params (the v2 defaults that produced the best results).
+SQUIGGLE_ROWS = 100
+SQUIGGLE_FREQ = 60.0
+SQUIGGLE_AMPLITUDE = 0.6
+SQUIGGLE_SAMPLES_PER_CYCLE = 10
+SQUIGGLE_ALTERNATE_PHASE = True
 
-class ImageFeatures(TypedDict):
-    """
-    Everything the synthesizer needs, derived from one blended frame.
-    All values are normalized 0.0–1.0 unless noted.
-    """
-    # Raw scanline data: list of 1-D float arrays (one per sampled row), values 0–1
-    scanlines: list
-
-    # Hue cluster centers (0–360) and their relative weights (sum to 1.0)
-    hue_centers: list   # list of floats, len = TONAL_NUM_VOICES
-    hue_weights: list   # list of floats, same len
-
-    # Texture repetition score per image quadrant (0 = smooth, 1 = highly repetitive)
-    texture_scores: list  # list of 4 floats (TL, TR, BL, BR)
-
-    # Overall brightness, saturation, edge density
-    brightness: float
-    saturation: float
-    edge_density: float
-
-    # DC offset / "heaviness" of the image (mean luminance)
-    luminance_mean: float
-    luminance_variance: float
-
-    # Motion between this frame and the previous one
-    motion_amount: float  # 0 = still, 1 = maximum change
-    motion_cx: float      # weighted centroid of motion, -1 (left) to +1 (right)
-    motion_cy: float      # weighted centroid of motion, -1 (top) to +1 (bottom)
+# Motion is computed against the previous frame's RGB array. Module-level
+# state since the analyzer is called serially from the main loop.
+_lock = threading.Lock()
+_last_array: np.ndarray | None = None
 
 
-_row_idx_cache: dict = {}   # h → row_indices array
-_coord_cache: dict   = {}   # (h, w) → (xs, ys) for motion centroid
-_prev_gray: np.ndarray | None = None  # cached gray from previous frame
-_prev_features: dict | None = None    # cached features for EMA smoothing
-
-# Features to smooth with EMA (excludes scanlines, texture_scores, motion_cx/cy)
-_SMOOTH_KEYS = ("brightness", "saturation", "edge_density",
-                "luminance_mean", "luminance_variance", "motion_amount")
+def reset_motion_state() -> None:
+    """Drop the cached previous frame. Useful between tests."""
+    global _last_array
+    with _lock:
+        _last_array = None
 
 
-def analyze(frame_rgb: np.ndarray, prev_frame: np.ndarray = None) -> ImageFeatures:
-    """
-    frame_rgb: H×W×3 uint8 numpy array (RGB)
-    prev_frame: previous frame (same shape) for motion detection, or None
-    Returns an ImageFeatures dict.
-    """
-    h, w = frame_rgb.shape[:2]
+# ── Squiggle drawer (longest-row variant) ────────────────────────────────
 
-    frame_float = frame_rgb.astype(np.float32) / 255.0
-    gray = _to_gray(frame_float)
-    hsv  = _rgb_to_hsv(frame_float)
+def _squiggle_longest_polyline(image: np.ndarray) -> np.ndarray:
+    """Run the squiggle strategy on a grayscale image, return the longest
+    row's (xs, ys) sample array of shape (N, 2). "Longest" here means
+    "most darkness-modulated content" — the row whose summed amplitude is
+    highest, since on a uniform image all rows have the same length."""
+    h, w = image.shape[:2]
+    gray = image.astype(np.float32) / 255.0
+    darkness = 1.0 - gray  # ink-on-paper convention
 
-    # ── Scanlines ─────────────────────────────────────────────────────────────
-    if h not in _row_idx_cache:
-        _row_idx_cache[h] = np.linspace(0, h - 1, cfg.GLITCH_SCANLINES, dtype=int)
-    scanlines = [gray[_row_idx_cache[h][i], :].tolist() for i in range(cfg.GLITCH_SCANLINES)]
+    row_spacing = h / SQUIGGLE_ROWS
+    half_band = row_spacing / 2.0
+    n_samples = max(16, int(SQUIGGLE_SAMPLES_PER_CYCLE * SQUIGGLE_FREQ))
+    xs = np.linspace(0.0, float(w), n_samples)
+    xs_idx = np.clip(xs.astype(int), 0, w - 1)
+    phases = 2.0 * math.pi * SQUIGGLE_FREQ * xs / w
 
-    # ── Hue clustering ────────────────────────────────────────────────────────
-    hue_mask = hsv[..., 1] > 0.15   # ignore near-grey pixels
-    hue_centers, hue_weights = _cluster_colors_kmeans(
-        frame_float, hue_mask, cfg.TONAL_NUM_VOICES
-    )
+    best_row_amp = -1.0
+    best_xs: np.ndarray | None = None
+    best_ys: np.ndarray | None = None
 
-    # ── Texture repetition (FFT of each quadrant) ─────────────────────────────
-    texture_scores = _texture_scores(gray)
+    for i in range(SQUIGGLE_ROWS):
+        y_center = (i + 0.5) * row_spacing
+        top = max(0, int(y_center - half_band))
+        bot = min(h, int(y_center + half_band + 1))
+        band = darkness[top:bot].mean(axis=0)
+        d = band[xs_idx]
+        amp = d * SQUIGGLE_AMPLITUDE * half_band
+        amp_sum = float(amp.sum())  # crude "row darkness" measure
+        phase_shift = math.pi if (SQUIGGLE_ALTERNATE_PHASE and i % 2) else 0.0
+        ys = y_center + np.sin(phases + phase_shift) * amp
+        if amp_sum > best_row_amp:
+            best_row_amp = amp_sum
+            best_xs = xs
+            best_ys = ys
 
-    # ── Global stats ──────────────────────────────────────────────────────────
-    brightness = float(np.mean(gray))
-    saturation = float(np.mean(hsv[..., 1]))
-    edge_density = _edge_density(gray)
-    luminance_variance = float(np.var(gray))
-
-    global _prev_gray
-    # Use cached prev_gray when prev_frame not explicitly provided
-    if prev_frame is not None:
-        prev_g = _to_gray(prev_frame.astype(np.float32) / 255.0)
-    else:
-        prev_g = _prev_gray
-    motion_amount, motion_cx, motion_cy = _motion_features(gray, h, w, prev_g)
-    _prev_gray = gray
-
-    features = ImageFeatures(
-        scanlines=scanlines,
-        hue_centers=[c * 360.0 for c in hue_centers],  # convert 0–1 → 0–360°
-        hue_weights=hue_weights,
-        texture_scores=texture_scores,
-        brightness=brightness,
-        saturation=saturation,
-        edge_density=edge_density,
-        luminance_mean=brightness,
-        luminance_variance=luminance_variance,
-        motion_amount=motion_amount,
-        motion_cx=motion_cx,
-        motion_cy=motion_cy,
-    )
-
-    return _smooth_features(features)
+    if best_xs is None or best_ys is None:
+        # Image had no darkness anywhere — return a zero row at image centre.
+        best_xs = xs
+        best_ys = np.full_like(xs, h / 2.0)
+    return np.stack([best_xs, best_ys], axis=-1).astype(np.float32)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Polyline arc-length sampler ──────────────────────────────────────────
 
-def _smooth_features(features: ImageFeatures) -> ImageFeatures:
-    """Apply EMA smoothing to selected features for frame-to-frame consistency."""
-    global _prev_features
-    alpha = cfg.FEATURE_SMOOTHING
-    if _prev_features is None or alpha >= 1.0:
-        _prev_features = dict(features)
-        return features
+def _normalize_voice(signal: np.ndarray) -> np.ndarray:
+    """Condition a 1-D signal for seamless looping.
 
-    smoothed = dict(features)
-
-    # Smooth scalar features with standard EMA
-    for key in _SMOOTH_KEYS:
-        smoothed[key] = alpha * features[key] + (1.0 - alpha) * _prev_features[key]
-
-    # Smooth hue_weights with standard EMA
-    smoothed["hue_weights"] = [
-        alpha * w + (1.0 - alpha) * pw
-        for w, pw in zip(features["hue_weights"], _prev_features["hue_weights"])
-    ]
-    # Renormalize weights
-    wt = sum(smoothed["hue_weights"]) or 1.0
-    smoothed["hue_weights"] = [w / wt for w in smoothed["hue_weights"]]
-
-    # Smooth hue_centers with circular averaging (avoid 0/360 wraparound)
-    smoothed_hues = []
-    for h_new, h_prev in zip(features["hue_centers"], _prev_features["hue_centers"]):
-        rad_new = np.radians(h_new)
-        rad_prev = np.radians(h_prev)
-        cx = alpha * np.cos(rad_new) + (1.0 - alpha) * np.cos(rad_prev)
-        cy = alpha * np.sin(rad_new) + (1.0 - alpha) * np.sin(rad_prev)
-        smoothed_hues.append(float(np.degrees(np.arctan2(cy, cx)) % 360.0))
-    smoothed["hue_centers"] = smoothed_hues
-
-    _prev_features = dict(smoothed)
-    return ImageFeatures(**smoothed)
+    Resample to CYCLE_SAMPLES, gentle wrap-mode Gaussian smoothing,
+    linear detrend so endpoints meet, scale to [-1, 1]."""
+    sig = np.asarray(signal, dtype=np.float32)
+    if len(sig) < 2:
+        return np.zeros(CYCLE_SAMPLES, dtype=np.float32)
+    if len(sig) != CYCLE_SAMPLES:
+        old_idx = np.linspace(0.0, 1.0, len(sig))
+        new_idx = np.linspace(0.0, 1.0, CYCLE_SAMPLES)
+        sig = np.interp(new_idx, old_idx, sig).astype(np.float32)
+    sig = gaussian_filter1d(sig, sigma=2.0, mode="wrap").astype(np.float32)
+    n = len(sig)
+    trend = np.linspace(0.0, float(sig[-1] - sig[0]), n).astype(np.float32)
+    sig = sig - trend
+    lo, hi = float(sig.min()), float(sig.max())
+    span = hi - lo
+    if span < 1e-9:
+        return np.zeros(CYCLE_SAMPLES, dtype=np.float32)
+    return (2.0 * (sig - lo) / span - 1.0).astype(np.float32)
 
 
-def _to_gray(frame_float: np.ndarray) -> np.ndarray:
-    """BT.601 luma from float32 RGB (H×W×3, values 0–1)."""
-    return (0.2126 * frame_float[..., 0] +
-            0.7152 * frame_float[..., 1] +
-            0.0722 * frame_float[..., 2])
-
-
-def _rgb_to_hsv(rgb: np.ndarray) -> np.ndarray:
-    """Vectorised RGB→HSV. rgb shape: H×W×3, values 0–1. Returns H×W×3."""
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    maxc = np.max(rgb, axis=-1)
-    minc = np.min(rgb, axis=-1)
-    v = maxc
-    s = np.where(maxc != 0, (maxc - minc) / maxc, 0.0)
-
-    delta = maxc - minc
-    h = np.zeros_like(maxc)
-    mask = delta != 0
-    # hue calculation per channel
-    mr = mask & (maxc == r)
-    mg = mask & (maxc == g)
-    mb = mask & (maxc == b)
-    h[mr] = ((g[mr] - b[mr]) / delta[mr]) % 6
-    h[mg] = (b[mg] - r[mg]) / delta[mg] + 2
-    h[mb] = (r[mb] - g[mb]) / delta[mb] + 4
-    h = h / 6.0  # normalise to 0–1
-
-    return np.stack([h, s, v], axis=-1)
-
-
-def _cluster_hues(hues_01: np.ndarray, n: int):
-    """
-    Simple histogram-based hue clustering.
-    Returns (centers_01, weights) each of length n.
-    """
-    if len(hues_01) == 0:
-        # No saturated pixels — return evenly spaced neutral centres
-        centers = np.linspace(0, 1, n, endpoint=False).tolist()
-        weights = [1.0 / n] * n
-        return centers, weights
-
-    bins = 72  # 5° buckets
-    hist, edges = np.histogram(hues_01, bins=bins, range=(0, 1))
-    hist = hist.astype(np.float32)
-
-    centers = []
-    weights = []
-    hist_work = hist.copy()
-
-    for _ in range(n):
-        peak = int(np.argmax(hist_work))
-        center = float((edges[peak] + edges[peak + 1]) / 2.0)
-        weight = float(hist_work[peak])
-        centers.append(center)
-        weights.append(weight)
-
-        # suppress neighbourhood (±15° = ±3 bins) so next peak is different
-        lo = max(0, peak - 3)
-        hi = min(bins, peak + 4)
-        hist_work[lo:hi] = 0
-
-    total = sum(weights) or 1.0
-    weights = [w / total for w in weights]
-    return centers, weights
-
-
-_MiniBatchKMeans = None  # deferred import
-
-
-def _cluster_colors_kmeans(frame_float: np.ndarray, hue_mask: np.ndarray,
-                           n: int):
-    """
-    KMeans clustering on RGB pixels for perceptually better color detection.
-    Falls back to histogram method when too few saturated pixels.
-    Returns (centers_01, weights) each of length n — hue centers in 0–1 range.
-    """
-    global _MiniBatchKMeans
-    pixels = frame_float[hue_mask]
-
-    if len(pixels) < n:
-        # Too few saturated pixels — fall back to histogram
-        hsv = _rgb_to_hsv(frame_float)
-        hues = hsv[..., 0][hue_mask]
-        return _cluster_hues(hues, n)
-
-    # Deferred import to avoid slow sklearn load at startup
-    if _MiniBatchKMeans is None:
-        from sklearn.cluster import MiniBatchKMeans
-        _MiniBatchKMeans = MiniBatchKMeans
-
-    # Subsample for speed
-    max_samples = cfg.COLOR_CLUSTER_SAMPLES
-    rng = np.random.default_rng(42)
-    if len(pixels) > max_samples:
-        idx = rng.choice(len(pixels), max_samples, replace=False)
-        pixels = pixels[idx]
-
-    km = _MiniBatchKMeans(n_clusters=n, batch_size=256, n_init=1,
-                          max_iter=10, random_state=42)
-    km.fit(pixels)
-
-    # Convert RGB cluster centers to HSV hue
-    centers_rgb = km.cluster_centers_.astype(np.float32)
-    # Reshape to (1, n, 3) for _rgb_to_hsv, then extract hues
-    centers_hsv = _rgb_to_hsv(centers_rgb.reshape(1, -1, 3))
-    hue_centers = centers_hsv[0, :, 0].tolist()  # 0–1 range
-
-    # Weights = proportion of pixels per cluster
-    labels = km.labels_
-    counts = np.bincount(labels, minlength=n).astype(float)
-    total = counts.sum() or 1.0
-    weights = (counts / total).tolist()
-
-    # Sort by weight descending
-    paired = sorted(zip(weights, hue_centers), reverse=True)
-    weights = [p[0] for p in paired]
-    hue_centers = [p[1] for p in paired]
-
-    return hue_centers, weights
-
-
-def _texture_scores(gray: np.ndarray) -> list:
-    """
-    Measure repetitiveness in each quadrant using 2-D FFT.
-    Score 0 = smooth/flat, 1 = highly repetitive pattern.
-    """
-    h, w = gray.shape
-    mh, mw = h // 2, w // 2
-    quadrants = [
-        gray[:mh, :mw],
-        gray[:mh, mw:],
-        gray[mh:, :mw],
-        gray[mh:, mw:],
-    ]
-    scores = []
-    for q in quadrants:
-        if q.size == 0:
-            scores.append(0.0)
+def _polyline_to_voices(polyline: np.ndarray) -> np.ndarray:
+    """Split a polyline into VOICES equal-arc-length chunks, projecting each
+    chunk's y onto a normalised cycle. Returns (VOICES, CYCLE_SAMPLES)."""
+    voices = np.zeros((VOICES, CYCLE_SAMPLES), dtype=np.float32)
+    if polyline.shape[0] < VOICES + 1:
+        return voices
+    diffs = np.diff(polyline, axis=0)
+    seg_lens = np.linalg.norm(diffs, axis=1)
+    cumlen = np.concatenate([[0.0], np.cumsum(seg_lens)]).astype(np.float32)
+    total = float(cumlen[-1])
+    if total < 1e-6:
+        return voices
+    bounds = np.linspace(0.0, total, VOICES + 1)
+    for v in range(VOICES):
+        a0, a1 = float(bounds[v]), float(bounds[v + 1])
+        if a1 - a0 < 1e-6:
             continue
-        # Downsample for speed, then use rfft2 (real input → ~half the output)
-        q_ds = q[::2, ::2]
-        fft = np.fft.rfft2(q_ds)
-        mag = np.abs(np.fft.fftshift(fft, axes=0))
-        # DC component in shifted rfft2 output
-        mag[mag.shape[0] // 2, 0] = 0
-        # Repetition score: energy in discrete peaks vs total energy
-        total = np.sum(mag) + 1e-9
-        threshold = np.percentile(mag, 95)
-        peak_energy = np.sum(mag[mag >= threshold])
-        scores.append(float(np.clip(peak_energy / total, 0, 1)))
-    return scores
+        n_query = max(64, polyline.shape[0] // VOICES)
+        target_arc = np.linspace(a0, a1, n_query, dtype=np.float32)
+        sample_y = np.interp(target_arc, cumlen, polyline[:, 1])
+        voices[v] = _normalize_voice(sample_y)
+    return voices
 
 
-def _edge_density(gray: np.ndarray) -> float:
-    """Sobel edge density, normalised 0–1."""
-    gray_ds = gray[::2, ::2]
-    sx = ndimage.sobel(gray_ds, axis=1)
-    sy = ndimage.sobel(gray_ds, axis=0)
-    magnitude = np.hypot(sx, sy)
-    return float(np.clip(np.mean(magnitude) * 4.0, 0.0, 1.0))
+# ── Source-image features ────────────────────────────────────────────────
+
+DEFAULT_FEATURES: dict[str, float] = {
+    "brightness": 0.5,
+    "saturation": 0.5,
+    "edge_density": 0.5,
+    "hue": 0.5,
+    "motion": 0.0,
+}
 
 
-def _motion_features(gray: np.ndarray, h: int, w: int, prev_gray) -> tuple:
-    """
-    Compute motion amount and spatial centre of motion vs the previous frame.
-    Returns (motion_amount, motion_cx, motion_cy).
-      motion_amount : 0–1, scaled by MOTION_SENSITIVITY
-      motion_cx     : -1 (left-heavy motion) to +1 (right-heavy)
-      motion_cy     : -1 (top-heavy)  to +1 (bottom-heavy)
-    """
-    if prev_gray is None:
-        return 0.0, 0.0, 0.0
+def _compute_features(rgb: np.ndarray) -> dict[str, float]:
+    """Compute the small feature set the synthesizer uses. ``rgb`` is float32
+    in [0, 1] of shape (H, W, 3). Updates module motion cache as a side
+    effect."""
+    global _last_array
 
-    diff = np.abs(gray - prev_gray)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    brightness = float(np.clip(luma.mean(), 0.0, 1.0))
 
-    raw    = float(np.mean(diff))
-    amount = float(np.clip(raw * cfg.MOTION_SENSITIVITY * 8.0, 0.0, 1.0))
+    max_c = rgb.max(axis=2)
+    chroma = max_c - rgb.min(axis=2)
+    saturation = float(np.clip((chroma / (max_c + 1e-6)).mean(), 0.0, 1.0))
 
-    # Weighted centroid gives direction of motion; coordinate arrays are cached
-    if (h, w) not in _coord_cache:
-        _coord_cache[(h, w)] = (np.linspace(0.0, 1.0, w), np.linspace(0.0, 1.0, h))
-    xs, ys = _coord_cache[(h, w)]
+    dy = np.abs(np.diff(luma, axis=0))
+    dx = np.abs(np.diff(luma, axis=1))
+    edge_density = float(np.clip((dy.mean() + dx.mean()) / 2.0 * 8.0, 0.0, 1.0))
 
-    total = float(np.sum(diff)) + 1e-9
-    cx = float(np.sum(diff * xs[np.newaxis, :]) / total) * 2.0 - 1.0
-    cy = float(np.sum(diff * ys[:, np.newaxis]) / total) * 2.0 - 1.0
+    # Saturation/value-weighted circular-mean hue.
+    delta_safe = np.where(chroma > 1e-6, chroma, 1.0)
+    h_raw = np.zeros_like(max_c, dtype=np.float32)
+    r_dom = (max_c == r) & (chroma > 1e-6)
+    g_dom = (max_c == g) & (chroma > 1e-6) & ~r_dom
+    b_dom = (max_c == b) & (chroma > 1e-6) & ~r_dom & ~g_dom
+    h_raw[r_dom] = ((g[r_dom] - b[r_dom]) / delta_safe[r_dom]) % 6.0
+    h_raw[g_dom] = (b[g_dom] - r[g_dom]) / delta_safe[g_dom] + 2.0
+    h_raw[b_dom] = (r[b_dom] - g[b_dom]) / delta_safe[b_dom] + 4.0
+    hue_rad = h_raw * (np.pi / 3.0)
+    weights = chroma * max_c
+    mean_sin = float((np.sin(hue_rad) * weights).sum())
+    mean_cos = float((np.cos(hue_rad) * weights).sum())
+    total_w = float(weights.sum()) + 1e-9
+    hue_mag = math.sqrt(mean_sin * mean_sin + mean_cos * mean_cos) / total_w
+    if hue_mag < 0.04:
+        hue = 0.5
+    else:
+        hue = float((math.atan2(mean_sin, mean_cos) / (2.0 * math.pi)) % 1.0)
 
-    return amount, cx, cy
+    with _lock:
+        motion = 0.0
+        if _last_array is not None and _last_array.shape == rgb.shape:
+            motion = float(np.clip(np.abs(rgb - _last_array).mean() * 6.0, 0.0, 1.0))
+        _last_array = rgb
+    return {
+        "brightness": brightness,
+        "saturation": saturation,
+        "edge_density": edge_density,
+        "hue": hue,
+        "motion": motion,
+    }
+
+
+# ── Public entry point ───────────────────────────────────────────────────
+
+def analyze(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
+    """Run the full image-analysis pipeline.
+
+    ``frame`` is an H×W×3 uint8 RGB numpy array fresh from the camera.
+    Returns ``(voices, features)`` where voices is (6, 1024) float32 in
+    [-1, 1] and features is a dict of 0–1 floats."""
+    if frame.size == 0 or frame.ndim != 3 or frame.shape[2] != 3:
+        return (
+            np.zeros((VOICES, CYCLE_SAMPLES), dtype=np.float32),
+            dict(DEFAULT_FEATURES),
+        )
+    rgb_f = frame.astype(np.float32) / 255.0
+    features = _compute_features(rgb_f)
+    # Run squiggle on a luminance image for speed.
+    luma = (0.299 * frame[..., 0] + 0.587 * frame[..., 1] + 0.114 * frame[..., 2]).astype(np.uint8)
+    polyline = _squiggle_longest_polyline(luma)
+    voices = _polyline_to_voices(polyline)
+    return voices, features
+
+
+# Backwards-compatible thin wrapper used by older callers.
+def analyze_features_only(frame: np.ndarray) -> dict[str, float]:
+    _, features = analyze(frame)
+    return features
+
+
+__all__ = [
+    "VOICES",
+    "CYCLE_SAMPLES",
+    "DEFAULT_FEATURES",
+    "analyze",
+    "analyze_features_only",
+    "reset_motion_state",
+]
+
+
+# Convenience for use via PIL.Image (e.g. file-based sources).
+def analyze_image(image: Image.Image) -> tuple[np.ndarray, dict[str, float]]:
+    return analyze(np.asarray(image.convert("RGB"), dtype=np.uint8))

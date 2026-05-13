@@ -12,8 +12,6 @@ dependencies = [
     "flask>=3.0",
     "pillow>=10.0",
     "python-dotenv>=1.0",
-    "pedalboard>=0.9.22",
-    "scikit-learn>=1.8.0",
 ]
 
 [project.optional-dependencies]

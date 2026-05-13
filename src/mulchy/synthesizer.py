@@ -1,395 +1,448 @@
-"""
-Mulchy - Synthesizer
-Takes an ImageFeatures dict and produces a numpy audio buffer.
-Three layers: glitch (raw scanline), tonal (hue→pitch), rhythm (texture→drums).
-"""
+"""Mulchy — synthesizer (v3).
+
+Pre-render + ring-buffer architecture. The expensive work (cycle resampling,
+lifetime envelopes, role envelopes, convolution reverb) all happens in the
+main thread, in the 200 ms window between camera frames. The audio thread
+does nothing except a numpy memcpy from a continuous ring buffer to the
+audio device — it cannot starve, cannot underrun, cannot click.
+
+Why this shape: in real-time callbacks Python can't reliably synthesize
+six voices with envelopes and filters inside a ~21 ms callback budget on
+a Pi. The earlier sounddevice-callback version was constantly producing
+underruns that sounded like "clipping in and out." Pre-rendering moves
+the heavy math to a thread that *has* the time budget.
+
+Each frame arrives, the analyzer hands us (6 voices × 1024-sample cycles)
+plus features. We render 9 s of audio per voice — cycle samples × lifetime
+envelope (1.5 s in / 3 s hold / 4.5 s out) × role envelope (drone LFO,
+bowl swell, or pluck transient) — sum them, apply convolution reverb on
+the mix, and additively mix the result into a 30-second ring buffer
+starting at the current playback time. Multiple frames' contributions
+overlap in the buffer; old contributions fade out via their lifetime
+envelope and the buffer's read cursor zeroes everything as it consumes it.
+
+A debug WAV tap captures the last N seconds of output to /tmp/mulchy_debug.wav
+so the engine's actual output can be inspected without speakers."""
+
+from __future__ import annotations
+
+import logging
+import math
+import random
+import threading
+import time
+import wave
+from pathlib import Path
 
 import numpy as np
-from pedalboard import Chorus, Compressor, Pedalboard, Reverb
-from scipy.signal import butter, sosfilt
+from scipy.signal import butter, fftconvolve, sosfilt
 
 from mulchy import config as cfg
-from mulchy.analyzer import ImageFeatures
+from mulchy.analyzer import CYCLE_SAMPLES, VOICES
 
-# ── Filter / envelope caches ──────────────────────────────────────────────────
-# Butterworth design is expensive; cache by (rounded) cutoff frequency.
-_lp_sos_cache: dict  = {}   # hz_key → sos coefficients
-_adsr_cache: dict    = {}   # n_samples → envelope array
-_time_cache: dict    = {}   # n_samples → time array
-_arange_cache: dict  = {}   # n_samples → np.arange(n) int array
-_taper_cache: dict   = {}   # taper_n → cosine taper array
-_noise_buf: np.ndarray = np.random.default_rng(42).uniform(-1.0, 1.0, 44100)
+log = logging.getLogger(__name__)
 
-# ── Synth state (persists across frames) ─────────────────────────────────────
-_tonal_phases: dict[int, float] = {}   # voice_idx → phase in radians
-_prev_tail: np.ndarray | None = None   # last overlap_n samples for crossfade
+# ── Compositional constants ──────────────────────────────────────────────
+VOICE_ROLES   = ("drone", "bowl", "bowl", "bowl", "pluck", "pluck")
+VOICE_RATIOS  = (1.0, 4.0 / 3.0, 1.5, 2.0, 2.5, 4.0)
+# Per-voice gains. Multiple source layers per voice sum linearly (up to ~4
+# overlapping fades), so these are deliberately set so a worst-case
+# 4-overlap peak per voice is still ≤ ~1.0 before the master stage.
+VOICE_GAINS   = (0.22, 0.18, 0.15, 0.13, 0.20, 0.16)
+# Per-voice lowpass cutoffs. Squiggle cycle waveforms carry a high-frequency
+# carrier (~60 sine periods baked into each 1024-sample cycle); without
+# filtering the dominant audible energy lands at ~F_base × 60 (≈ 4.8 kHz
+# at 80 Hz base), which is what made the unfiltered build sound like
+# whistling/screech. These cutoffs tame the carrier and leave the slow
+# darkness-envelope content, mirroring v2's BiquadFilterNode.
+FILTER_CUTOFFS = {"drone": 350.0, "bowl": 1500.0, "pluck": 3000.0}
 
+MASTER_GAIN = 0.18
 
-_fx_board: Pedalboard | None = None
-_fx_config_hash: tuple | None = None
+DRONE_LFO_HZ    = 0.04
+DRONE_LFO_DEPTH = 0.25
 
+BOWL_PERIODS_S = (17.0, 23.0, 29.0)
+BOWL_OFFSETS_S = (3.0,  8.0,  14.0)
 
-def reset_synth_state():
-    """Clear all stateful synth data. Call between tests."""
-    global _prev_tail, _fx_board, _fx_config_hash
-    _tonal_phases.clear()
-    _prev_tail = None
-    _fx_board = None
-    _fx_config_hash = None
+PLUCK_MIN_S    = (10.0, 7.0)
+PLUCK_MAX_S    = (22.0, 16.0)
+PLUCK_DECAY_S  = (1.8,  1.1)
+PLUCK_ATTACK_S = 0.02
 
+SOURCE_FADE_IN_S  = 1.5
+SOURCE_SUSTAIN_S  = 3.0
+SOURCE_FADE_OUT_S = 4.5
+SOURCE_LIFETIME_S = SOURCE_FADE_IN_S + SOURCE_SUSTAIN_S + SOURCE_FADE_OUT_S  # 9.0 s
 
-def _get_fx_board() -> Pedalboard | None:
-    """Build or return cached pedalboard effects chain. Returns None if all FX disabled."""
-    global _fx_board, _fx_config_hash
-    current_hash = (
-        cfg.FX_REVERB_ENABLED, cfg.FX_REVERB_ROOM_SIZE, cfg.FX_REVERB_WET,
-        cfg.FX_CHORUS_ENABLED, cfg.FX_CHORUS_RATE, cfg.FX_CHORUS_DEPTH, cfg.FX_CHORUS_MIX,
-        cfg.FX_COMPRESSOR_ENABLED, cfg.FX_COMPRESSOR_THRESHOLD, cfg.FX_COMPRESSOR_RATIO,
-    )
-    if current_hash == _fx_config_hash:
-        return _fx_board
+HUE_PITCH_RANGE = 1.0   # ± half octave
+ENERGY_MIN = 0.85
+ENERGY_MAX = 1.15
 
-    plugins = []
-    if cfg.FX_CHORUS_ENABLED:
-        plugins.append(Chorus(
-            rate_hz=cfg.FX_CHORUS_RATE,
-            depth=cfg.FX_CHORUS_DEPTH,
-            mix=cfg.FX_CHORUS_MIX,
-        ))
-    if cfg.FX_REVERB_ENABLED:
-        plugins.append(Reverb(
-            room_size=cfg.FX_REVERB_ROOM_SIZE,
-            wet_level=cfg.FX_REVERB_WET,
-            dry_level=1.0 - cfg.FX_REVERB_WET,
-        ))
-    if cfg.FX_COMPRESSOR_ENABLED:
-        plugins.append(Compressor(
-            threshold_db=cfg.FX_COMPRESSOR_THRESHOLD,
-            ratio=cfg.FX_COMPRESSOR_RATIO,
-        ))
+REVERB_DURATION_S = 2.0
+REVERB_DECAY      = 3.0
+REVERB_WET        = 0.35
 
-    _fx_board = Pedalboard(plugins) if plugins else None
-    _fx_config_hash = current_hash
-    return _fx_board
+RING_BUFFER_SECONDS = 30   # generous; never overflows at 5 fps
+
+DEBUG_WAV_PATH      = Path("/tmp/mulchy_debug.wav")
+DEBUG_WAV_INTERVAL_S = 10.0  # rewrite the debug WAV every N seconds
 
 
-def _get_sos(hz: float, order: int = 2) -> np.ndarray:
-    key = (round(hz / 100) * 100, order)
-    if key not in _lp_sos_cache:
-        _lp_sos_cache[key] = butter(order, key[0], fs=cfg.SAMPLE_RATE,
-                                    btype="low", output="sos")
-    return _lp_sos_cache[key]
+# ── Envelope helpers (all pure numpy) ────────────────────────────────────
 
-
-def _get_adsr(n: int) -> np.ndarray:
-    if n not in _adsr_cache:
-        _adsr_cache[n] = _adsr(n, attack=0.20, decay=0.05, sustain=0.85, release=0.10)
-    return _adsr_cache[n]
-
-
-def _get_time(n: int) -> np.ndarray:
-    if n not in _time_cache:
-        _time_cache[n] = np.arange(n, dtype=np.float64) / cfg.SAMPLE_RATE
-    return _time_cache[n]
-
-
-def _get_arange(n: int) -> np.ndarray:
-    if n not in _arange_cache:
-        _arange_cache[n] = np.arange(n)
-    return _arange_cache[n]
-
-
-def _get_taper(taper_n: int) -> np.ndarray:
-    if taper_n not in _taper_cache:
-        _taper_cache[taper_n] = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, taper_n)))
-    return _taper_cache[taper_n]
-
-
-def synthesize(features: ImageFeatures) -> np.ndarray:
-    """
-    Render one audio chunk from image features.
-    Returns float32 numpy array, shape (N,), values roughly -1..1.
-    """
-    n_samples = int(cfg.SAMPLE_RATE * cfg.AUDIO_SECONDS)
-
-    glitch  = _layer_glitch(features, n_samples)
-    tonal   = _layer_tonal(features, n_samples)
-    rhythm  = _layer_rhythm(features, n_samples)
-
-    # Mix layers
-    mixed = (
-        glitch  * cfg.LAYER_GLITCH_LEVEL +
-        tonal   * cfg.LAYER_TONAL_LEVEL  +
-        rhythm  * cfg.LAYER_RHYTHM_LEVEL
-    )
-
-    # Filter cutoff opens with edge density: smooth surfaces = muted, busy textures = bright
-    edge_density = features.get("edge_density", 0.5)
-    lp_hz = float(np.clip(cfg.MIX_LOWPASS_HZ * (0.3 + edge_density * 1.4),
-                          300, cfg.SAMPLE_RATE // 2 - 100))
-    mixed = sosfilt(_get_sos(lp_hz), mixed)
-
-    # Apply pedalboard effects chain (reverb, chorus, compressor)
-    fx = _get_fx_board()
-    if fx is not None:
-        mixed_f32 = mixed.astype(np.float32).reshape(1, -1)
-        mixed_f32 = fx(mixed_f32, cfg.SAMPLE_RATE)
-        mixed = mixed_f32[0].astype(np.float64)
-
-    # Gentle peak normalise — no saturation distortion
-    peak = np.max(np.abs(mixed)) + 1e-9
-    if peak > 0.0:
-        mixed = mixed / peak * 0.85
-    mixed *= cfg.MASTER_VOLUME
-
-    # Overlap-add crossfading — blends the tail of the previous chunk with
-    # the head of the new one, eliminating amplitude dips at boundaries.
-    global _prev_tail
-    taper_ms = max(2.0, 40.0 * (1.0 - cfg.CROSSFADE_SMOOTHNESS))
-    taper_n = min(int(cfg.SAMPLE_RATE * taper_ms / 1000.0), n_samples // 8)
-    taper = _get_taper(taper_n)
-
-    if _prev_tail is not None and len(_prev_tail) == taper_n:
-        # Crossfade: blend previous tail (fading out) with current head (fading in)
-        mixed[:taper_n] = _prev_tail * taper[::-1] + mixed[:taper_n] * taper
-    else:
-        # First chunk: just fade in
-        mixed[:taper_n] *= taper
-
-    # Store tail for next frame's crossfade (no fade-out applied to output)
-    _prev_tail = mixed[-taper_n:].copy()
-
-    return mixed.astype(np.float32)
-
-
-# ── Layer 1: Glitch (raw scanline → waveform) ─────────────────────────────────
-
-def _layer_glitch(features: ImageFeatures, n_samples: int) -> np.ndarray:
-    """
-    Each scanline becomes a tiled waveform. Rows are stacked and summed.
-    This is the Wii-RAM-audio effect: raw pixel data played back as sound.
-    """
-    if not features["scanlines"]:
-        return np.zeros(n_samples)
-
-    result = np.zeros(n_samples, dtype=np.float64)
-    weight = 1.0 / len(features["scanlines"])
-
-    motion = features.get("motion_amount", 0.0)
-
-    for i, row in enumerate(features["scanlines"]):
-        row_arr = np.array(row, dtype=np.float64) * 2.0 - 1.0  # 0..1 → -1..1
-
-        # Motion makes the glitch layer speed up / pitch-shift more
-        pitch = cfg.GLITCH_PITCH_SHIFT * (1.0 + i * 0.03 + motion * 0.5)
-        stretched_len = max(1, int(len(row_arr) / pitch))
-        indices = (_get_arange(n_samples) % stretched_len).astype(int)
-        tiled = row_arr[np.clip(indices, 0, len(row_arr) - 1)]
-
-        # Modulate amplitude by image brightness variance
-        amp = 0.5 + features["luminance_variance"] * 2.0
-        result += tiled * weight * amp
-
-    result = sosfilt(_get_sos(cfg.GLITCH_LOW_PASS_HZ, order=4), result)
-
-    return result
-
-
-# ── Layer 2: Tonal (hue clusters → pitched oscillators) ───────────────────────
-
-def _layer_tonal(features: ImageFeatures, n_samples: int) -> np.ndarray:
-    """
-    Each dominant hue maps to a pitch on a pentatonic scale.
-    Weight = how dominant that colour is → amplitude of that oscillator.
-    """
-    t = _get_time(n_samples)
-    result = np.zeros(n_samples, dtype=np.float64)
-
-    scale = cfg.TONAL_SCALE_SEMITONES
-
-    # Brightness shifts the register: dark scene = deep bass, bright = high & airy
-    brightness = features.get("brightness", 0.5)
-    bright_shift = (brightness - 0.5) * 24.0  # ±12 semitones = ±1 octave
-    base_freq = _midi_to_hz(12 * cfg.TONAL_OCTAVE_BASE) * _semitones_to_ratio(bright_shift)
-
-    # Saturation gates voices: grey/desaturated = simple drone, colourful = full chord
-    saturation = features.get("saturation", 0.5)
-    n_voices_total = max(1, len(features["hue_centers"]))
-    n_active_voices = max(1, round(0.5 + saturation * n_voices_total))
-
-    # Motion: horizontal pan bends pitch like a theremin; vertical shifts octave
-    motion = features.get("motion_amount", 0.0)
-    motion_cx = features.get("motion_cx", 0.0)
-    pitch_bend_semitones = motion_cx * cfg.MOTION_PITCH_SEMITONES * motion
-    pitch_bend_ratio = _semitones_to_ratio(pitch_bend_semitones)
-
-    # Vibrato LFO: rate and depth scale with motion_amount
-    lfo_rate  = 2.0 + motion * 6.0    # 2–8 Hz
-    lfo_depth = motion * 0.015        # up to ±1.5% freq wobble
-    lfo = 1.0 + lfo_depth * np.sin(2.0 * np.pi * lfo_rate * t)
-
-    for voice_idx, (hue_deg, weight) in enumerate(
-        zip(features["hue_centers"][:n_active_voices], features["hue_weights"][:n_active_voices])
-    ):
-        # Map hue (0–360) → scale degree
-        hue_norm = hue_deg / 360.0
-        scale_idx = int(hue_norm * len(scale)) % len(scale)
-        semitone = scale[scale_idx]
-
-        # Spread voices across octave range; vertical motion nudges octave
-        octave_offset = (voice_idx % cfg.TONAL_OCTAVE_RANGE) * 12
-        semitone += octave_offset
-
-        # Slight detune for richness
-        detune_hz = _semitones_to_ratio(cfg.TONAL_DETUNE_CENTS / 100.0)
-        freq = base_freq * _semitones_to_ratio(semitone) * pitch_bend_ratio
-
-        # Phase-continuous oscillator — carry phase across frames
-        main_phase_key = voice_idx
-        detune_phase_key = voice_idx + 1000
-        start_phase = _tonal_phases.get(main_phase_key, 0.0)
-        detune_start = _tonal_phases.get(detune_phase_key, 0.0)
-
-        if cfg.TONAL_WAVEFORM == "sine":
-            # Vibrato via cumulative phase modulation (LFO-FM)
-            phase = start_phase + 2.0 * np.pi * freq * np.cumsum(lfo) / cfg.SAMPLE_RATE
-            wave = np.sin(phase)
-            _tonal_phases[main_phase_key] = float(phase[-1] % (2.0 * np.pi))
-        else:
-            wave, end_phase = _oscillator(cfg.TONAL_WAVEFORM, freq, t, start_phase)
-            _tonal_phases[main_phase_key] = end_phase
-
-        # Add slightly detuned copy with its own phase continuity
-        detune_wave, detune_end = _oscillator(cfg.TONAL_WAVEFORM, freq * detune_hz, t, detune_start)
-        wave += detune_wave * 0.4
-        wave /= 1.4  # normalise after detune
-        _tonal_phases[detune_phase_key] = detune_end
-
-        amp_env = _get_adsr(n_samples) * (weight * (0.4 + features["saturation"] * 0.6))
-
-        result += wave * amp_env
-
-    return result / n_active_voices
-
-
-def _oscillator(shape: str, freq: float, t: np.ndarray,
-                start_phase: float = 0.0) -> tuple[np.ndarray, float]:
-    """Generate waveform with phase continuity. Returns (waveform, end_phase)."""
-    phase = start_phase + 2.0 * np.pi * freq * t
-    end_phase = float(phase[-1] % (2.0 * np.pi)) if len(phase) > 0 else start_phase
-    if shape == "sine":
-        return np.sin(phase), end_phase
-    elif shape == "triangle":
-        # Use phase-based triangle for continuity
-        p_norm = (phase / (2.0 * np.pi)) % 1.0
-        return 2.0 * np.abs(2.0 * p_norm - 1.0) - 1.0, end_phase
-    elif shape == "sawtooth":
-        p_norm = (phase / (2.0 * np.pi)) % 1.0
-        return 2.0 * p_norm - 1.0, end_phase
-    elif shape == "square":
-        return np.sign(np.sin(phase)), end_phase
-    return np.sin(phase), end_phase
-
-
-def _adsr(n: int, attack: float, decay: float,
-          sustain: float, release: float) -> np.ndarray:
-    """Simple ADSR envelope, all times as fraction of total length."""
-    env = np.ones(n)
-    a = int(n * attack)
-    d = int(n * decay)
-    r = int(n * release)
-    s_level = sustain
-    if a > 0:
-        env[:a] = np.linspace(0, 1, a)
-    if d > 0:
-        env[a:a+d] = np.linspace(1, s_level, d)
-    env[a+d:n-r] = s_level
-    if r > 0:
-        env[n-r:] = np.linspace(s_level, 0, r)
+def _lifetime_envelope(t: np.ndarray) -> np.ndarray:
+    """1.5 s fade-in → 3 s sustain → 4.5 s fade-out, sampled at times t."""
+    env = np.zeros_like(t, dtype=np.float32)
+    in_in  = (t >= 0)                            & (t < SOURCE_FADE_IN_S)
+    in_sus = (t >= SOURCE_FADE_IN_S)             & (t < SOURCE_FADE_IN_S + SOURCE_SUSTAIN_S)
+    in_out = (t >= SOURCE_FADE_IN_S + SOURCE_SUSTAIN_S) & (t < SOURCE_LIFETIME_S)
+    env[in_in]  = t[in_in] / SOURCE_FADE_IN_S
+    env[in_sus] = 1.0
+    env[in_out] = 1.0 - (t[in_out] - (SOURCE_FADE_IN_S + SOURCE_SUSTAIN_S)) / SOURCE_FADE_OUT_S
     return env
 
 
-# ── Layer 3: Rhythm (texture FFT → percussive hits) ───────────────────────────
-
-def _layer_rhythm(features: ImageFeatures, n_samples: int) -> np.ndarray:
-    """
-    Texture repetition scores (per quadrant) determine what hits fire when.
-    TL → kick, TR → snare, BL/BR → hi-hats.
-    """
-    result = np.zeros(n_samples, dtype=np.float64)
-    scores = features["texture_scores"]  # [TL, TR, BL, BR]
-
-    motion = features.get("motion_amount", 0.0)
-    effective_bpm = cfg.RHYTHM_BPM * (1.0 + motion * cfg.MOTION_TEMPO_SCALE)
-    beat_samples = int(cfg.SAMPLE_RATE * 60.0 / effective_bpm)
-    step_samples = beat_samples // (cfg.RHYTHM_SUBDIVISIONS // 4)
-    n_steps = n_samples // step_samples
-
-    tl = scores[0] if len(scores) > 0 else 0.0
-    tr = scores[1] if len(scores) > 1 else 0.0
-    bl = scores[2] if len(scores) > 2 else 0.0
-    br = scores[3] if len(scores) > 3 else 0.0
-
-    thresh = cfg.RHYTHM_TEXTURE_THRESH
-
-    for step in range(n_steps):
-        t_start = step * step_samples
-        quarter   = step % 4 == 0
-        backbeat  = step % 4 == 2
-        eighth    = step % 2 == 0
-
-        # Kick: fires on quarters if bottom-left texture is repetitive
-        if quarter and tl > thresh:
-            vel = 0.5 + tl * 0.5
-            result = _add_hit(result, t_start, n_samples, cfg.RHYTHM_KICK_HZ, vel,
-                              cfg.RHYTHM_DECAY_MS * 3)
-
-        # Snare: fires on backbeats if top-right is repetitive
-        if backbeat and tr > thresh:
-            vel = 0.4 + tr * 0.5
-            result = _add_hit(result, t_start, n_samples, cfg.RHYTHM_SNARE_HZ, vel,
-                              cfg.RHYTHM_DECAY_MS * 1.5, noise_mix=0.5)
-
-        # Hi-hat: fires on eighths if either right quadrant is repetitive
-        hat_score = (bl + br) / 2.0
-        if eighth and hat_score > thresh * 0.7:
-            vel = 0.2 + hat_score * 0.3
-            result = _add_hit(result, t_start, n_samples, cfg.RHYTHM_HAT_HZ, vel,
-                              cfg.RHYTHM_DECAY_MS * 0.5, noise_mix=0.85)
-
-    return result
+def _bowl_envelope(t_abs: np.ndarray, period: float, offset: float) -> np.ndarray:
+    attack  = period * 0.08
+    sustain = period * 0.40
+    decay   = period * 0.30
+    phase = (t_abs - offset) % period
+    env = np.zeros_like(phase, dtype=np.float32)
+    a = (phase >= 0)          & (phase < attack)
+    s = (phase >= attack)     & (phase < attack + sustain)
+    d = (phase >= attack + sustain) & (phase < attack + sustain + decay)
+    env[a] = phase[a] / attack
+    env[s] = 1.0
+    env[d] = 1.0 - (phase[d] - attack - sustain) / decay
+    return env
 
 
-def _add_hit(buf: np.ndarray, start: int, total: int,
-             freq: float, velocity: float, decay_ms: float,
-             noise_mix: float = 0.0) -> np.ndarray:
-    """
-    Add a single percussive hit at sample position `start`.
-    Blends a sine tone with noise for different drum sounds.
-    """
-    decay_samples = int(cfg.SAMPLE_RATE * decay_ms / 1000.0)
-    end = min(start + decay_samples, total)
-    n = end - start
-    if n <= 0:
-        return buf
-
-    t = _get_time(n)
-    env = np.exp(-t / (decay_ms / 1000.0 * 0.3))
-
-    tone  = np.sin(2.0 * np.pi * freq * t)
-    noise = _noise_buf[:n]
-
-    hit = tone * (1.0 - noise_mix) + noise * noise_mix
-    hit *= env * velocity
-
-    buf[start:end] += hit
-    return buf
+def _pluck_event_env(t_abs: np.ndarray, trig: float, decay_s: float) -> np.ndarray:
+    rel = t_abs - trig
+    env = np.zeros_like(rel, dtype=np.float32)
+    a = (rel >= 0) & (rel < PLUCK_ATTACK_S)
+    d = (rel >= PLUCK_ATTACK_S) & (rel < PLUCK_ATTACK_S + decay_s)
+    env[a] = rel[a] / PLUCK_ATTACK_S
+    if d.any():
+        env[d] = np.exp(-3.0 * (rel[d] - PLUCK_ATTACK_S) / decay_s)
+    return env
 
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+def _make_lowpass_sos(cutoff_hz: float, sr: int) -> np.ndarray:
+    """2nd-order Butterworth lowpass as SOS."""
+    nyq = sr / 2.0
+    norm = max(20.0, min(cutoff_hz, nyq * 0.95)) / nyq
+    return butter(2, norm, btype="low", output="sos")
 
-def _midi_to_hz(midi_note: int) -> float:
-    return 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
 
-def _semitones_to_ratio(semitones: float) -> float:
-    return 2.0 ** (semitones / 12.0)
+def _make_reverb_ir(sr: int, duration_s: float, decay: float) -> np.ndarray:
+    n = max(1, int(duration_s * sr))
+    rng = np.random.default_rng(42)
+    ir = rng.uniform(-1.0, 1.0, n).astype(np.float32)
+    env = np.power(1.0 - np.arange(n) / n, decay).astype(np.float32)
+    ir *= env
+    # Normalise so reverb wet level is roughly in the same ballpark as the dry.
+    ir /= max(1e-6, float(np.sqrt((ir * ir).sum())))
+    return ir
+
+
+# ── Synthesizer ──────────────────────────────────────────────────────────
+
+class Synthesizer:
+    def __init__(
+        self,
+        sample_rate: int | None = None,
+        base_freq: float = 80.0,
+        audio_enabled: bool = True,
+        record_debug_wav: bool = True,
+    ):
+        self.sr = int(sample_rate or cfg.SAMPLE_RATE)
+        self.base_freq = float(base_freq)
+
+        self._buffer_size = RING_BUFFER_SECONDS * self.sr
+        self._ring = np.zeros(self._buffer_size, dtype=np.float32)
+        self._read_pos = 0   # audio thread advances
+        self._lock = threading.Lock()
+
+        self._reverb_ir = _make_reverb_ir(self.sr, REVERB_DURATION_S, REVERB_DECAY)
+
+        # Pre-compute per-voice lowpass SOS. Applied to each frame's voice
+        # contribution before mixing — kills the carrier-frequency energy
+        # baked into the squiggle cycle so we hear the slow envelope
+        # content (which is what the v2 sandbox sounds like).
+        self._voice_sos = [
+            _make_lowpass_sos(FILTER_CUTOFFS[r], self.sr) for r in VOICE_ROLES
+        ]
+
+        self._pluck_events: list[list[dict]] = [[], []]
+        self._pluck_next_check = [3.0, 6.0]
+        self._rng = random.Random(42)
+
+        # Feature-derived state.
+        self.hue_pitch_mult = 1.0
+        self.energy_gain = 1.0
+        self.pluck_rate_mult = 1.0
+
+        self._record_debug_wav = record_debug_wav
+        self._debug_wav_next_dump = DEBUG_WAV_INTERVAL_S
+
+        # When audio is disabled (--no-audio / no sounddevice), the audio
+        # thread isn't running and read_pos would stay at 0 forever, so
+        # mixed frames would all stack on top of each other. Track wall
+        # clock and advance read_pos manually in that mode.
+        self._wallclock_last_t: float | None = None
+
+        self._stream = None
+        if audio_enabled:
+            self._open_stream()
+        log.info(
+            "Synthesizer ready: %d Hz, base=%.1f Hz, ring=%d s, record_wav=%s",
+            self.sr, self.base_freq, RING_BUFFER_SECONDS, self._record_debug_wav,
+        )
+
+    # ── Audio stream (trivial callback — never starves) ──────────────
+
+    def _open_stream(self) -> None:
+        try:
+            import sounddevice as sd
+        except Exception as e:
+            log.warning("sounddevice unavailable (%s) — running silently", e)
+            return
+        self._stream = sd.OutputStream(
+            samplerate=self.sr,
+            channels=1,
+            dtype="float32",
+            blocksize=0,  # let portaudio pick
+            callback=self._callback,
+        )
+        self._stream.start()
+        log.info("Audio stream started")
+
+    def _callback(self, outdata, frames, time_info, status):
+        if status:
+            log.debug("audio status: %s", status)
+        with self._lock:
+            start = self._read_pos % self._buffer_size
+            end = self._read_pos + frames
+            if end <= self._read_pos + (self._buffer_size - start):
+                outdata[:, 0] = self._ring[start:start + frames]
+                self._ring[start:start + frames] = 0.0
+            else:
+                first = self._buffer_size - start
+                outdata[:first, 0] = self._ring[start:]
+                outdata[first:, 0] = self._ring[: frames - first]
+                self._ring[start:] = 0.0
+                self._ring[: frames - first] = 0.0
+            self._read_pos += frames
+
+    def close(self) -> None:
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+        # Always capture a final snapshot so smoke tests can inspect the
+        # engine's output without needing speakers.
+        if self._record_debug_wav:
+            self._dump_debug_wav()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._ring.fill(0.0)
+            self._read_pos = 0
+        self._pluck_events = [[], []]
+        self._pluck_next_check = [3.0, 6.0]
+
+    # ── Main-thread API ──────────────────────────────────────────────
+
+    def update(self, voices: np.ndarray, features: dict[str, float]) -> None:
+        """Pre-render this frame's 9-second contribution and mix into the
+        ring buffer. Called once per camera frame from the main loop."""
+        if voices.shape != (VOICES, CYCLE_SAMPLES):
+            return
+        self._apply_features(features)
+
+        # Headless mode: advance the read cursor by wall-clock delta so
+        # successive updates land at successive time offsets in the ring
+        # buffer (instead of all stacking on read_pos=0).
+        if self._stream is None:
+            now = time.monotonic()
+            if self._wallclock_last_t is not None:
+                advance = max(0, int((now - self._wallclock_last_t) * self.sr))
+                with self._lock:
+                    self._read_pos += advance
+            self._wallclock_last_t = now
+
+        with self._lock:
+            t_now_samples = self._read_pos
+        t_now = t_now_samples / self.sr
+
+        n = int(SOURCE_LIFETIME_S * self.sr)
+        t_rel = np.arange(n, dtype=np.float32) / self.sr
+        t_abs = (t_now + t_rel).astype(np.float32)
+        lifetime = _lifetime_envelope(t_rel)
+
+        # Schedule any plucks that should fire in this window.
+        self._schedule_plucks(t_now)
+
+        master = np.zeros(n, dtype=np.float32)
+        for v_idx in range(VOICES):
+            master += self._render_voice(voices[v_idx], v_idx, t_abs, lifetime)
+
+        # Convolution reverb: produces a tail longer than `n` samples. Mix the
+        # full tail into the ring buffer too so reverb continues past the
+        # source's lifetime.
+        wet = fftconvolve(master, self._reverb_ir, mode="full").astype(np.float32)
+        mix = np.zeros(len(wet), dtype=np.float32)
+        mix[:n] = master * (1.0 - REVERB_WET)
+        mix += wet * REVERB_WET
+        mix *= self.energy_gain * MASTER_GAIN
+
+        # Tanh soft-saturation as a final safety. Cheap and prevents the
+        # ring buffer from ever exceeding ±1 even when many frames stack.
+        np.tanh(mix, out=mix)
+
+        with self._lock:
+            self._mix_into_ring(t_now_samples, mix)
+
+        # Debug WAV: snapshot the past ~RING_BUFFER_SECONDS-ish every interval.
+        if self._record_debug_wav and t_now >= self._debug_wav_next_dump:
+            self._dump_debug_wav()
+            self._debug_wav_next_dump = t_now + DEBUG_WAV_INTERVAL_S
+
+    # ── Internals ────────────────────────────────────────────────────
+
+    def _apply_features(self, f: dict[str, float]) -> None:
+        b = float(f.get("brightness", 0.5))
+        e = float(f.get("edge_density", 0.5))
+        h = float(f.get("hue", 0.5))
+        m = float(f.get("motion", 0.0))
+        self.hue_pitch_mult = 2.0 ** ((h - 0.5) * HUE_PITCH_RANGE)
+        self.energy_gain = ENERGY_MIN + (ENERGY_MAX - ENERGY_MIN) * b
+        edge_factor = 2.0 - 1.6 * e
+        motion_factor = 1.0 - 0.55 * m
+        self.pluck_rate_mult = max(0.25, edge_factor * motion_factor)
+
+    def _render_voice(
+        self,
+        cycle: np.ndarray,
+        v_idx: int,
+        t_abs: np.ndarray,
+        lifetime: np.ndarray,
+    ) -> np.ndarray:
+        n = len(t_abs)
+        sample_step = (
+            self.base_freq * self.hue_pitch_mult * VOICE_RATIOS[v_idx]
+            * CYCLE_SAMPLES / self.sr
+        )
+        positions = (np.arange(n, dtype=np.float32) * sample_step) % CYCLE_SAMPLES
+        floor = positions.astype(np.int32)
+        frac = positions - floor
+        nxt = (floor + 1) % CYCLE_SAMPLES
+        samples = cycle[floor] * (1.0 - frac) + cycle[nxt] * frac
+
+        role = VOICE_ROLES[v_idx]
+        if role == "drone":
+            role_env = (1.0 + DRONE_LFO_DEPTH *
+                        np.sin(2.0 * math.pi * DRONE_LFO_HZ * t_abs)).astype(np.float32)
+        elif role == "bowl":
+            b_idx = v_idx - 1
+            role_env = _bowl_envelope(t_abs,
+                                      BOWL_PERIODS_S[b_idx],
+                                      BOWL_OFFSETS_S[b_idx])
+        else:  # pluck
+            p_idx = v_idx - 4
+            role_env = self._pluck_envelope_in_window(p_idx, t_abs)
+
+        # Lifetime envelope + cycle samples first, then through per-voice
+        # lowpass (kills the squiggle carrier so what's audible is the
+        # slow image-darkness envelope), then role envelope, then voice gain.
+        # The lifetime envelope is 0 at t=0 so the filter sees a clean
+        # zero start and doesn't ring.
+        signal = (samples * lifetime).astype(np.float32)
+        filtered = sosfilt(self._voice_sos[v_idx], signal).astype(np.float32)
+        out = filtered * role_env * VOICE_GAINS[v_idx]
+        return out.astype(np.float32)
+
+    def _pluck_envelope_in_window(self, p_idx: int, t_abs: np.ndarray) -> np.ndarray:
+        env = np.zeros_like(t_abs, dtype=np.float32)
+        win_start = float(t_abs[0])
+        win_end   = float(t_abs[-1])
+        for ev in self._pluck_events[p_idx]:
+            trig = ev["trigger_time"]
+            decay = ev["decay"]
+            if trig > win_end or trig + PLUCK_ATTACK_S + decay < win_start:
+                continue
+            np.maximum(env, _pluck_event_env(t_abs, trig, decay), out=env)
+        return env
+
+    def _schedule_plucks(self, t_now: float) -> None:
+        """Make sure each pluck voice has one future scheduled event."""
+        for p_idx in range(2):
+            if t_now + SOURCE_LIFETIME_S >= self._pluck_next_check[p_idx]:
+                lo = PLUCK_MIN_S[p_idx]
+                hi = PLUCK_MAX_S[p_idx]
+                delay = self._rng.uniform(lo, hi) * self.pluck_rate_mult
+                trig = self._pluck_next_check[p_idx] + max(0.1, delay)
+                self._pluck_events[p_idx].append(
+                    {"trigger_time": trig, "decay": PLUCK_DECAY_S[p_idx]}
+                )
+                self._pluck_next_check[p_idx] = trig
+            # Drop pluck events whose tail is fully in the past.
+            self._pluck_events[p_idx] = [
+                ev for ev in self._pluck_events[p_idx]
+                if ev["trigger_time"] + PLUCK_ATTACK_S + ev["decay"] > t_now - 1.0
+            ]
+
+    def _mix_into_ring(self, start_samples: int, audio: np.ndarray) -> None:
+        n = len(audio)
+        if n > self._buffer_size:
+            # Should never happen — but truncate instead of crashing if it does.
+            audio = audio[: self._buffer_size]
+            n = self._buffer_size
+        start = start_samples % self._buffer_size
+        if start + n <= self._buffer_size:
+            self._ring[start:start + n] += audio
+            return
+        first = self._buffer_size - start
+        self._ring[start:] += audio[:first]
+        self._ring[: n - first] += audio[first:]
+
+    def _dump_debug_wav(self) -> None:
+        """Capture roughly RING_BUFFER_SECONDS of recent audio to a WAV
+        file. Reads from the ring buffer's "future" region (past read_pos)
+        plus a snapshot of what we just mixed."""
+        try:
+            with self._lock:
+                # Build a contiguous snapshot: starting just behind the
+                # current read position, going forward through the buffer.
+                # This gives the most recent ~RING_BUFFER_SECONDS of audio
+                # in playback order. Note: positions past read_pos haven't
+                # played yet; they're the future-mixed content.
+                base = (self._read_pos - self._buffer_size // 4) % self._buffer_size
+                idx = (base + np.arange(self._buffer_size)) % self._buffer_size
+                snap = self._ring[idx].copy()
+            # int16 WAV at sr.
+            clipped = np.clip(snap, -1.0, 1.0)
+            ints = (clipped * 32767).astype(np.int16)
+            with wave.open(str(DEBUG_WAV_PATH), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(self.sr)
+                wf.writeframes(ints.tobytes())
+            log.info("Debug WAV updated: %s (%d s)", DEBUG_WAV_PATH, RING_BUFFER_SECONDS)
+        except Exception as e:  # pragma: no cover - diagnostic, must not crash audio
+            log.warning("debug WAV dump failed: %s", e)
+
+
+# Module-level convenience for the legacy test helper.
+_default_synth: Synthesizer | None = None
+
+
+def reset_synth_state() -> None:
+    global _default_synth
+    if _default_synth is not None:
+        _default_synth.reset()
+
+
+__all__ = ["Synthesizer", "VOICES", "CYCLE_SAMPLES", "reset_synth_state"]
