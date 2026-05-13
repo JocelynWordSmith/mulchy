@@ -12,13 +12,16 @@ dependencies = [
     "flask>=3.0",
     "pillow>=10.0",
     "python-dotenv>=1.0",
+    # Pure-Python ctypes wrapper around libportaudio2 (apt-installed on the
+    # Pi). Importing it fails gracefully at runtime if portaudio is missing,
+    # so it's safe to install even on dev machines without audio libs.
+    "sounddevice",
 ]
 
 [project.optional-dependencies]
-# picamera2 and sounddevice are installed manually on the Pi (see scripts/install.sh)
-# They are not listed here because picamera2 requires system apt packages (libcap-dev)
-# and sounddevice requires libportaudio2 — neither resolves cleanly in a standard venv.
-audio  = ["sounddevice"]
+# picamera2 isn't listed here — it's installed via apt as python3-picamera2
+# and inherited into the uv venv through --system-site-packages, because its
+# python3-libcamera native dependency only ships as an apt package.
 webcam = ["opencv-python-headless"]
 dev = [
     "pytest>=8.0",
@@ -47,8 +50,9 @@ ignore = [
 testpaths = ["tests"]
 addopts   = [
     "--tb=short",
-    # Suppress ROS/ament pytest plugins that are registered system-wide but
-    # are incompatible with the Python 3.11 venv used here.
+    # Suppress ROS/ament pytest plugins that are registered system-wide and
+    # leak into this venv via --system-site-packages — they're not part of
+    # this project's deps and error out when auto-loaded.
     "-p", "no:launch_testing",
     "-p", "no:launch_ros",
     "-p", "no:ament_flake8",

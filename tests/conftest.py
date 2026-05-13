@@ -7,7 +7,6 @@ import pytest
 
 from mulchy import config as cfg
 from mulchy.analyzer import reset_motion_state
-from mulchy.synthesizer import reset_synth_state
 
 
 @pytest.fixture
@@ -25,9 +24,8 @@ def clean_config():
 
 @pytest.fixture(autouse=True)
 def clear_state():
-    """Reset analyzer + synthesizer state before each test."""
+    """Reset analyzer state before each test."""
     reset_motion_state()
-    reset_synth_state()
     yield
 
 

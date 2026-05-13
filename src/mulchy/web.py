@@ -9,7 +9,6 @@ Audio output goes to the 3.5 mm jack via PipeWire — not streamed here."""
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import io
 import logging
@@ -54,11 +53,10 @@ def _encode_jpeg(frame: np.ndarray, quality: int = 70) -> bytes:
     return buf.getvalue()
 
 
-def update(raw_frame, blended_frame=None, features=None, audio_chunk=None) -> None:
+def update(frame, features=None) -> None:
     """Called once per main-loop iteration. Latest frame is held for the
     MJPEG stream; features can be peeked at via /api/status."""
     global _frame_jpeg, _features
-    frame = blended_frame if blended_frame is not None else raw_frame
     if frame is None:
         return
     fj = _encode_jpeg(frame)
@@ -480,15 +478,6 @@ def wifi_connect_route():
     return jsonify({"ok": True, "ssid": ssid or con_name})
 
 
-@app.route("/wifi/disconnect", methods=["POST"])
-def wifi_disconnect_route():
-    if not _wifi_authed():
-        return jsonify({"error": "unauthorized"}), 401
-    _nmcli("dev", "disconnect", "wlan0", timeout=10)
-    _nmcli("con", "up", _AP_CON, timeout=15)
-    return jsonify({"ok": True})
-
-
 @app.route("/wifi/remove", methods=["POST"])
 def wifi_remove_route():
     if not _wifi_authed():
@@ -498,7 +487,3 @@ def wifi_remove_route():
         return jsonify({"error": "invalid name"}), 400
     _, err, rc = _nmcli("con", "delete", name, timeout=10)
     return jsonify({"ok": rc == 0, "error": err.strip() if rc != 0 else None})
-
-
-# Suppress the previously-imported but now-unused things (PIL, base64).
-_ = (base64,)

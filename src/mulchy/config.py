@@ -17,20 +17,8 @@ CAMERA_FPS    = 5
 # 22050 Hz is plenty for ambient drone material (most energy lives below
 # 1–2 kHz) and halves the synthesizer's CPU cost vs 44.1k — important on
 # the Pi where the pre-render runs in the main thread.
-SAMPLE_RATE    = 22050
-AUDIO_CHANNELS = 1
-AUDIO_SECONDS  = 1.0 / CAMERA_FPS  # legacy alias; not used by the new engine
+SAMPLE_RATE = 22050
 
 # Synth base frequency — all six voices are ratios of this. Hue modulates
 # it ±½ octave per frame.
 SYNTH_BASE_HZ = 80.0
-
-
-# ── Legacy compat stubs ─────────────────────────────────────────────────
-# The device no longer has presets/settings; the dashboard's preset UI in
-# web.py keeps loading via these inert stubs.
-PRESETS: dict = {"default": {}}
-
-
-def load_preset(_name: str) -> None:
-    return None

@@ -77,7 +77,7 @@ class Mulchy:
             self._synth.update(voices, features)
             update_ms = (time.monotonic() - t2) * 1000
 
-            web.update(frame, frame, features)
+            web.update(frame, features)
 
             stats["frames"] += 1
             stats["analyze_ms"] += analyze_ms

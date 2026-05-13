@@ -435,14 +435,4 @@ class Synthesizer:
             log.warning("debug WAV dump failed: %s", e)
 
 
-# Module-level convenience for the legacy test helper.
-_default_synth: Synthesizer | None = None
-
-
-def reset_synth_state() -> None:
-    global _default_synth
-    if _default_synth is not None:
-        _default_synth.reset()
-
-
-__all__ = ["Synthesizer", "VOICES", "CYCLE_SAMPLES", "reset_synth_state"]
+__all__ = ["Synthesizer", "VOICES", "CYCLE_SAMPLES"]

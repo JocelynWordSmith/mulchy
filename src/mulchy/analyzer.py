@@ -23,7 +23,6 @@ import math
 import threading
 
 import numpy as np
-from PIL import Image
 from scipy.ndimage import gaussian_filter1d
 
 # === Drawing / sampling constants (locked-in defaults from the sandbox) ===
@@ -228,22 +227,10 @@ def analyze(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
     return voices, features
 
 
-# Backwards-compatible thin wrapper used by older callers.
-def analyze_features_only(frame: np.ndarray) -> dict[str, float]:
-    _, features = analyze(frame)
-    return features
-
-
 __all__ = [
     "VOICES",
     "CYCLE_SAMPLES",
     "DEFAULT_FEATURES",
     "analyze",
-    "analyze_features_only",
     "reset_motion_state",
 ]
-
-
-# Convenience for use via PIL.Image (e.g. file-based sources).
-def analyze_image(image: Image.Image) -> tuple[np.ndarray, dict[str, float]]:
-    return analyze(np.asarray(image.convert("RGB"), dtype=np.uint8))
